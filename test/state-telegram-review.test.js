@@ -62,24 +62,24 @@ test("buildPromptMessage renders concise conversational prompt", () => {
     confidence: 0.83,
     observation_event: {
       field: "travel.location",
-      candidate_value: "Tahoe"
+      candidate_value: "We are in Tahoe now."
     }
   }, 1, 16);
 
-  assert.match(msg, /Quick state check 1\/16/);
-  assert.match(msg, /possible travel update/i);
-  assert.match(msg, /Confidence: 83%/);
-  assert.match(msg, /Tap a button below/);
+  assert.equal(
+    msg,
+    "I detected a possible travel update. Could you confirm you are in Tahoe now?"
+  );
 });
 
-test("buildPromptButtons returns 3 inline actions", () => {
+test("buildPromptButtons returns only yes/no actions", () => {
   const id = "2013aa48-c103-403c-aa55-cbd3cf226e71";
   const buttons = buildPromptButtons(id);
   assert.equal(Array.isArray(buttons), true);
-  assert.equal(buttons.length, 2);
+  assert.equal(buttons.length, 1);
   assert.equal(buttons[0].length, 2);
-  assert.equal(buttons[1].length, 1);
+  assert.equal(buttons[0][0].text, "Yes");
+  assert.equal(buttons[0][1].text, "No");
   assert.equal(buttons[0][0].callback_data, `state_confirm:${id}`);
   assert.equal(buttons[0][1].callback_data, `state_reject:${id}`);
-  assert.equal(buttons[1][0].callback_data, `state_edit:${id}`);
 });

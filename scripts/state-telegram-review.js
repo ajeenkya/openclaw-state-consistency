@@ -398,36 +398,38 @@ function summarizeValue(value, maxLen = 260) {
   return `${compact.slice(0, maxLen - 1)}…`;
 }
 
+function toConfirmationPhrase(candidateValue) {
+  if (typeof candidateValue !== "string") {
+    return "this update is correct";
+  }
+  let phrase = candidateValue.trim();
+  if (!phrase) {
+    return "this update is correct";
+  }
+  phrase = phrase.replace(/[.?!]+$/, "");
+  phrase = phrase.replace(/^we are\b/i, "you are");
+  phrase = phrase.replace(/^we're\b/i, "you are");
+  phrase = phrase.replace(/^i am\b/i, "you are");
+  phrase = phrase.replace(/^i'm\b/i, "you are");
+  phrase = phrase.trim();
+  if (!phrase) {
+    return "this update is correct";
+  }
+  return phrase;
+}
+
 function buildPromptMessage(pending, index, total) {
-  const field = pending?.observation_event?.field || pending.proposed_change || "(unknown)";
-  const value = summarizeValue(pending?.observation_event?.candidate_value, 300);
-  const confidencePct = Math.round(Number(pending?.confidence || 0) * 100);
-  const domain = String(pending?.domain || "general").replace(/^./, (m) => m.toUpperCase());
-  const shortId = String(pending?.prompt_id || "").slice(0, 8);
-  return [
-    `Quick state check ${index}/${total}`,
-    "",
-    `I detected a possible ${domain.toLowerCase()} update and want your confirmation before I act on it.`,
-    "",
-    `Proposed update`,
-    `${field} = ${value}`,
-    `Confidence: ${confidencePct}%`,
-    `Reference: ${shortId}`,
-    "",
-    "Tap a button below.",
-    `If you want a custom value, reply: edit ${shortId} <new value>`
-  ].join("\n");
+  const domain = String(pending?.domain || "general").toLowerCase();
+  const phrase = toConfirmationPhrase(pending?.observation_event?.candidate_value);
+  return `I detected a possible ${domain} update. Could you confirm ${phrase}?`;
 }
 
 function buildPromptButtons(promptId) {
   const id = String(promptId || "");
   return [
     [
-      { text: "✅ Confirm", callback_data: `state_confirm:${id}` },
-      { text: "❌ Reject", callback_data: `state_reject:${id}` }
-    ],
-    [
-      { text: "✏️ Edit value", callback_data: `state_edit:${id}` }
+      { text: "Yes", callback_data: `state_confirm:${id}` },
+      { text: "No", callback_data: `state_reject:${id}` }
     ]
   ];
 }
