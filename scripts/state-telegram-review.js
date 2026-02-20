@@ -101,10 +101,13 @@ function parseJsonFromMixedOutput(raw) {
   }
 }
 
-function sendTelegramMessage(target, message, threadId) {
+function sendTelegramMessage(target, message, threadId, buttons) {
   const args = ["message", "send", "--channel", "telegram", "--target", target, "--message", message, "--json"];
   if (threadId) {
     args.push("--thread-id", String(threadId));
+  }
+  if (Array.isArray(buttons) && buttons.length > 0) {
+    args.push("--buttons", JSON.stringify(buttons));
   }
   const output = execFileSync("openclaw", args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
   return parseJsonFromMixedOutput(output);
@@ -208,6 +211,9 @@ function parseDecisionFromText(text) {
   }
   if (/^(reject|decline|no|n)\b/.test(lower)) {
     return { action: "reject" };
+  }
+  if (/^(edit|change)\b$/.test(lower)) {
+    return { action: "edit_help" };
   }
 
   const editMatch = raw.match(/^(?:edit|change|set)\s*[:\-]\s*([\s\S]+)$/i);
@@ -335,19 +341,32 @@ function summarizeValue(value, maxLen = 260) {
 function buildPromptMessage(pending, index, total) {
   const field = pending?.observation_event?.field || pending.proposed_change || "(unknown)";
   const value = summarizeValue(pending?.observation_event?.candidate_value, 300);
+  const confidencePct = Math.round(Number(pending?.confidence || 0) * 100);
+  const domain = String(pending?.domain || "general");
+  const shortId = String(pending?.prompt_id || "").slice(0, 8);
   return [
-    `State confirmation ${index}/${total}`,
-    `Prompt ID: ${pending.prompt_id}`,
-    `Domain: ${pending.domain}`,
-    `Confidence: ${pending.confidence}`,
-    `Field: ${field}`,
-    `Value: ${value}`,
+    `State update suggestion ${index}/${total}`,
     "",
-    "Reply with one:",
-    "confirm",
-    "reject",
-    "edit: <new value>"
+    `Domain: ${domain}`,
+    `Proposed: ${field} = ${value}`,
+    `Confidence: ${confidencePct}%`,
+    `Ref: ${shortId}`,
+    "",
+    "Choose one below.",
+    "For custom value, reply: edit: <new value>"
   ].join("\n");
+}
+
+function buildPromptButtons() {
+  return [
+    [
+      { text: "✅ Confirm", callback_data: "confirm" },
+      { text: "❌ Reject", callback_data: "reject" }
+    ],
+    [
+      { text: "✏️ Edit value", callback_data: "edit" }
+    ]
+  ];
 }
 
 function runConfirmCommand(paths, promptId, decision) {
@@ -439,28 +458,43 @@ function syncReviewOnce(rootDir, options = {}) {
     if (runtime.active_prompt_id) {
       const decision = pickDecisionForActivePrompt(parsed.userMessages, runtime.active_prompt_id);
       if (decision) {
-        const confirmResult = dryRun
-          ? { status: "dry_run", prompt_id: runtime.active_prompt_id, action: decision.action }
-          : runConfirmCommand(paths, runtime.active_prompt_id, decision);
+        if (decision.action === "edit_help") {
+          if (!dryRun) {
+            sendTelegramMessage(
+              target,
+              [
+                "Got it. Send your override like this:",
+                `edit: <new value>`,
+                "",
+                `Example: edit: \"Tahoe, Northstar\"`
+              ].join("\n"),
+              threadId
+            );
+          }
+        } else {
+          const confirmResult = dryRun
+            ? { status: "dry_run", prompt_id: runtime.active_prompt_id, action: decision.action }
+            : runConfirmCommand(paths, runtime.active_prompt_id, decision);
 
-        result.decision_applied = {
-          prompt_id: runtime.active_prompt_id,
-          action: decision.action,
-          from_message_id: decision.fromMessageId || "",
-          confirm_status: confirmResult.status || "unknown"
-        };
+          result.decision_applied = {
+            prompt_id: runtime.active_prompt_id,
+            action: decision.action,
+            from_message_id: decision.fromMessageId || "",
+            confirm_status: confirmResult.status || "unknown"
+          };
 
-        if (!dryRun) {
-          const ack = decision.action === "confirm"
-            ? `Confirmed ${runtime.active_prompt_id}.`
-            : decision.action === "reject"
-              ? `Rejected ${runtime.active_prompt_id}.`
-              : `Edited and confirmed ${runtime.active_prompt_id}.`;
-          sendTelegramMessage(target, ack, threadId);
+          if (!dryRun) {
+            const ack = decision.action === "confirm"
+              ? "Confirmed. I updated state."
+              : decision.action === "reject"
+                ? "Rejected. No state change made."
+                : "Edited and confirmed. State updated.";
+            sendTelegramMessage(target, ack, threadId);
+          }
+          runtime.last_decision_at = nowIso();
+          runtime.active_prompt_id = "";
+          runtime.active_message_id = "";
         }
-        runtime.last_decision_at = nowIso();
-        runtime.active_prompt_id = "";
-        runtime.active_message_id = "";
       }
     }
   }
@@ -474,7 +508,8 @@ function syncReviewOnce(rootDir, options = {}) {
   if (!runtime.active_prompt_id && pending.length > 0) {
     const next = pending[0];
     const message = buildPromptMessage(next, 1, pending.length);
-    const sendResult = dryRun ? { payload: { messageId: "dry-run" } } : sendTelegramMessage(target, message, threadId);
+    const buttons = buildPromptButtons();
+    const sendResult = dryRun ? { payload: { messageId: "dry-run" } } : sendTelegramMessage(target, message, threadId, buttons);
     runtime.active_prompt_id = next.prompt_id;
     runtime.active_message_id = String(sendResult?.payload?.messageId || "");
     runtime.last_dispatched_at = nowIso();
@@ -538,5 +573,6 @@ module.exports = {
   parseDecisionFromText,
   parseNewUserMessages,
   buildPromptMessage,
+  buildPromptButtons,
   syncReviewOnce
 };

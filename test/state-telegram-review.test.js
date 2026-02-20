@@ -6,7 +6,8 @@ const test = require("node:test");
 const {
   stripConversationEnvelope,
   parseDecisionFromText,
-  buildPromptMessage
+  buildPromptMessage,
+  buildPromptButtons
 } = require("../scripts/state-telegram-review");
 
 test("stripConversationEnvelope removes metadata wrappers", () => {
@@ -25,6 +26,7 @@ test("stripConversationEnvelope removes metadata wrappers", () => {
 test("parseDecisionFromText supports confirm/reject/edit commands", () => {
   assert.equal(parseDecisionFromText("confirm").action, "confirm");
   assert.equal(parseDecisionFromText("reject").action, "reject");
+  assert.equal(parseDecisionFromText("edit").action, "edit_help");
   const edited = parseDecisionFromText("edit: \"Tahoe Saturday\"");
   assert.equal(edited.action, "edit");
   assert.equal(edited.editedValue, "Tahoe Saturday");
@@ -49,8 +51,19 @@ test("buildPromptMessage renders concise conversational prompt", () => {
     }
   }, 1, 16);
 
-  assert.match(msg, /State confirmation 1\/16/);
-  assert.match(msg, /Prompt ID:/);
-  assert.match(msg, /Reply with one:/);
-  assert.match(msg, /confirm/);
+  assert.match(msg, /State update suggestion 1\/16/);
+  assert.match(msg, /Domain: travel/);
+  assert.match(msg, /Confidence: 83%/);
+  assert.match(msg, /Choose one below/);
+});
+
+test("buildPromptButtons returns 3 inline actions", () => {
+  const buttons = buildPromptButtons();
+  assert.equal(Array.isArray(buttons), true);
+  assert.equal(buttons.length, 2);
+  assert.equal(buttons[0].length, 2);
+  assert.equal(buttons[1].length, 1);
+  assert.equal(buttons[0][0].callback_data, "confirm");
+  assert.equal(buttons[0][1].callback_data, "reject");
+  assert.equal(buttons[1][0].callback_data, "edit");
 });
