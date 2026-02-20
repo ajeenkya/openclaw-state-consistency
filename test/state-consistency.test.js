@@ -9,6 +9,7 @@ const test = require("node:test");
 const {
   ensureStateFiles,
   getStatus,
+  getDoctorReport,
   ingestObservation,
   loadState,
   applyUserConfirmation,
@@ -62,6 +63,13 @@ function mkWorkspace() {
   );
 
   return dir;
+}
+
+function writeExecutable(dir, name) {
+  const filePath = path.join(dir, name);
+  fs.writeFileSync(filePath, "#!/bin/sh\nexit 0\n", "utf8");
+  fs.chmodSync(filePath, 0o755);
+  return filePath;
 }
 
 test("init creates state files and status baseline", () => {
@@ -433,4 +441,58 @@ test("retry-dlq replays due observation entries and marks them resolved", () => 
   const status = getStatus(rootDir);
   assert.equal(status.dlq.total, 1);
   assert.equal(status.dlq.resolved, 1);
+});
+
+test("doctor flags missing runtime config with actionable fixes", () => {
+  const rootDir = mkWorkspace();
+  const report = getDoctorReport(rootDir, {
+    env: {
+      PATH: ""
+    }
+  });
+
+  assert.equal(report.status, "degraded");
+  assert.equal(report.checks.schemas.status, "ok");
+  assert.equal(report.checks.canonical_files.status, "warn");
+  assert.equal(report.checks.binaries.status, "warn");
+  assert.equal(report.checks.poll_account.status, "warn");
+  assert.equal(report.checks.telegram_target.status, "warn");
+  assert.ok(report.fixes.some((fix) => fix.includes("STATE_GOG_ACCOUNT")));
+  assert.ok(report.fixes.some((fix) => fix.includes("STATE_TELEGRAM_TARGET")));
+  assert.ok(report.fixes.some((fix) => fix.includes("state:init")));
+});
+
+test("doctor resolves healthy runtime from cron config and PATH binaries", () => {
+  const rootDir = mkWorkspace();
+  ensureStateFiles(rootDir);
+
+  const binDir = path.join(rootDir, "fake-bin");
+  fs.mkdirSync(binDir, { recursive: true });
+  writeExecutable(binDir, "openclaw");
+  writeExecutable(binDir, "gog");
+
+  fs.writeFileSync(
+    path.join(rootDir, "cron-config.json"),
+    `${JSON.stringify({
+      accounts: { gogAccount: "aj@example.com" },
+      telegram: { ajId: "7986763678" }
+    }, null, 2)}\n`,
+    "utf8"
+  );
+
+  const report = getDoctorReport(rootDir, {
+    env: {
+      PATH: binDir
+    }
+  });
+
+  assert.equal(report.status, "ok");
+  assert.equal(report.checks.schemas.status, "ok");
+  assert.equal(report.checks.canonical_files.status, "ok");
+  assert.equal(report.checks.binaries.status, "ok");
+  assert.equal(report.checks.poll_account.status, "ok");
+  assert.equal(report.checks.poll_account.source, "cron-config.json accounts.gogAccount");
+  assert.equal(report.checks.telegram_target.status, "ok");
+  assert.equal(report.checks.telegram_target.source, "cron-config.json telegram.ajId");
+  assert.equal(report.fixes.length, 0);
 });

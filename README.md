@@ -36,6 +36,7 @@ npm run state:pending
 npm run state:telegram-review:run
 npm run state:project
 npm run state:health
+npm run state:doctor
 npm run state:retry-dlq -- --limit 25
 npm run state:plugin:install
 npm run lint
@@ -47,6 +48,8 @@ npm test
 
 - `npm run state:health` returns operational health with:
   - `pending`, `tentative`, `dlq`, `last_poll`, `last_review`
+- `npm run state:doctor` validates runtime prerequisites and prints exact fixes for:
+  - schema files, canonical files, `openclaw`/`gog` binaries, poll account config, Telegram target config
 - `npm run state:retry-dlq` retries due DLQ entries and marks each as:
   - `resolved`, `pending_retry`, or `failed_permanent`
 

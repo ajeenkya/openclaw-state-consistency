@@ -247,12 +247,104 @@ function computeDlqNextRetryTs(retryCount) {
   return new Date(Date.now() + waitMs).toISOString();
 }
 
-function resolveGogAccount(rootDir, explicitAccount) {
-  if (explicitAccount) {
-    return explicitAccount;
+function loadCronConfigInfo(rootDir) {
+  const configPath = path.join(rootDir, "cron-config.json");
+  if (!fs.existsSync(configPath)) {
+    return {
+      path: configPath,
+      status: "missing",
+      config: {},
+      error: null
+    };
   }
-  const cronConfig = readJsonIfExistsSafe(path.join(rootDir, "cron-config.json"), {});
+  try {
+    return {
+      path: configPath,
+      status: "ok",
+      config: JSON.parse(fs.readFileSync(configPath, "utf8")),
+      error: null
+    };
+  } catch (error) {
+    return {
+      path: configPath,
+      status: "invalid",
+      config: {},
+      error: error.message
+    };
+  }
+}
+
+function resolveGogAccount(rootDir, explicitAccount, env = process.env, cronInfo = null) {
+  if (explicitAccount) {
+    return String(explicitAccount);
+  }
+  if (env.STATE_GOG_ACCOUNT) {
+    return String(env.STATE_GOG_ACCOUNT);
+  }
+  const cronConfig = (cronInfo && cronInfo.config) || readJsonIfExistsSafe(path.join(rootDir, "cron-config.json"), {});
   return cronConfig?.accounts?.gogAccount || cronConfig?.accounts?.primary || "";
+}
+
+function resolveTelegramTarget(rootDir, explicitTarget, env = process.env, cronInfo = null) {
+  if (explicitTarget) {
+    return String(explicitTarget);
+  }
+  if (env.STATE_TELEGRAM_TARGET) {
+    return String(env.STATE_TELEGRAM_TARGET);
+  }
+  const cronConfig = (cronInfo && cronInfo.config) || readJsonIfExistsSafe(path.join(rootDir, "cron-config.json"), {});
+  if (cronConfig?.telegram?.ajId) {
+    return String(cronConfig.telegram.ajId);
+  }
+  if (cronConfig?.telegram?.defaultTarget) {
+    return String(cronConfig.telegram.defaultTarget);
+  }
+  return "";
+}
+
+function resolveExecutablePath(command, env = process.env) {
+  if (!command) {
+    return "";
+  }
+
+  const pathValue = String(env.PATH || "");
+  const pathEntries = pathValue.split(path.delimiter).filter(Boolean);
+  if (pathEntries.length === 0) {
+    return "";
+  }
+
+  const windowsExts = String(env.PATHEXT || ".EXE;.CMD;.BAT;.COM")
+    .split(";")
+    .filter(Boolean);
+  const extensions = process.platform === "win32" ? ["", ...windowsExts] : [""];
+
+  const hasPathSeparator = command.includes("/") || command.includes("\\");
+  if (hasPathSeparator) {
+    if (fs.existsSync(command)) {
+      return path.resolve(command);
+    }
+    return "";
+  }
+
+  for (const dir of pathEntries) {
+    for (const ext of extensions) {
+      const candidate = path.join(dir, process.platform === "win32" ? `${command}${ext}` : command);
+      if (fs.existsSync(candidate)) {
+        return candidate;
+      }
+    }
+  }
+  return "";
+}
+
+function aggregateStatuses(statuses) {
+  if (statuses.some((status) => status === "error")) {
+    return "error";
+  }
+  if (statuses.some((status) => status === "warn")) {
+    return "warn";
+  }
+  return "ok";
 }
 
 function createDefaultState() {
@@ -1742,6 +1834,299 @@ function getStatus(rootDir) {
   };
 }
 
+function getDoctorReport(rootDir, options = {}) {
+  const paths = getPaths(rootDir);
+  const env = options.env || process.env;
+  const fixes = [];
+  const seenFixes = new Set();
+  const addFix = (fix) => {
+    if (!fix || seenFixes.has(fix)) {
+      return;
+    }
+    seenFixes.add(fix);
+    fixes.push(fix);
+  };
+
+  const cronInfo = loadCronConfigInfo(rootDir);
+
+  const schemaChecks = [
+    { name: "StateObservation", file: paths.schemas.stateObservation },
+    { name: "UserConfirmation", file: paths.schemas.userConfirmation },
+    { name: "SignalEvent", file: paths.schemas.signalEvent }
+  ].map((schemaDef) => {
+    if (!fs.existsSync(schemaDef.file)) {
+      const fix = `Restore missing schema file: ${schemaDef.file}`;
+      addFix(fix);
+      return {
+        name: schemaDef.name,
+        path: schemaDef.file,
+        status: "error",
+        message: "schema file not found",
+        fix
+      };
+    }
+
+    let parsed;
+    try {
+      parsed = JSON.parse(fs.readFileSync(schemaDef.file, "utf8"));
+    } catch (error) {
+      const fix = `Fix JSON syntax in ${schemaDef.file}`;
+      addFix(fix);
+      return {
+        name: schemaDef.name,
+        path: schemaDef.file,
+        status: "error",
+        message: `invalid JSON: ${error.message}`,
+        fix
+      };
+    }
+
+    try {
+      const ajv = new Ajv({ allErrors: true, strict: true });
+      addFormats(ajv);
+      ajv.compile(parsed);
+    } catch (error) {
+      const fix = `Fix schema validation issues in ${schemaDef.file}`;
+      addFix(fix);
+      return {
+        name: schemaDef.name,
+        path: schemaDef.file,
+        status: "error",
+        message: `schema compilation failed: ${error.message}`,
+        fix
+      };
+    }
+
+    return {
+      name: schemaDef.name,
+      path: schemaDef.file,
+      status: "ok",
+      message: "schema is present and valid",
+      fix: null
+    };
+  });
+
+  const canonicalChecks = [
+    {
+      name: "state-tracker",
+      file: paths.stateTracker,
+      format: "json",
+      missingFix: "Run `npm run state:init` to create canonical state files."
+    },
+    {
+      name: "state-changes",
+      file: paths.stateChanges,
+      format: "text",
+      missingFix: "Run `npm run state:init` to create canonical state files."
+    },
+    {
+      name: "state-dlq",
+      file: paths.stateDlq,
+      format: "text",
+      missingFix: "Run `npm run state:init` to create canonical state files."
+    },
+    {
+      name: "HEARTBEAT.md",
+      file: paths.heartbeat,
+      format: "text",
+      missingFix: "Create HEARTBEAT.md (or run a projection command to generate machine-managed sections)."
+    }
+  ].map((entry) => {
+    if (!fs.existsSync(entry.file)) {
+      addFix(entry.missingFix);
+      return {
+        name: entry.name,
+        path: entry.file,
+        status: "warn",
+        message: "file not found",
+        fix: entry.missingFix
+      };
+    }
+
+    if (entry.format === "json") {
+      try {
+        JSON.parse(fs.readFileSync(entry.file, "utf8"));
+      } catch (error) {
+        const fix = `Repair invalid JSON in ${entry.file}`;
+        addFix(fix);
+        return {
+          name: entry.name,
+          path: entry.file,
+          status: "error",
+          message: `invalid JSON: ${error.message}`,
+          fix
+        };
+      }
+    }
+
+    return {
+      name: entry.name,
+      path: entry.file,
+      status: "ok",
+      message: "file is present",
+      fix: null
+    };
+  });
+
+  const binaryChecks = ["openclaw", "gog"].map((binary) => {
+    const resolvedPath = resolveExecutablePath(binary, env);
+    if (!resolvedPath) {
+      const fix = `Install ${binary} CLI and ensure \`${binary}\` is available on PATH.`;
+      addFix(fix);
+      return {
+        name: binary,
+        status: "warn",
+        path: null,
+        message: "binary not found on PATH",
+        fix
+      };
+    }
+    return {
+      name: binary,
+      status: "ok",
+      path: resolvedPath,
+      message: "binary found",
+      fix: null
+    };
+  });
+
+  let pollAccount = "";
+  let pollAccountSource = "none";
+  if (options.account) {
+    pollAccount = String(options.account);
+    pollAccountSource = "--account";
+  } else if (env.STATE_GOG_ACCOUNT) {
+    pollAccount = String(env.STATE_GOG_ACCOUNT);
+    pollAccountSource = "STATE_GOG_ACCOUNT";
+  } else if (cronInfo.config?.accounts?.gogAccount) {
+    pollAccount = String(cronInfo.config.accounts.gogAccount);
+    pollAccountSource = "cron-config.json accounts.gogAccount";
+  } else if (cronInfo.config?.accounts?.primary) {
+    pollAccount = String(cronInfo.config.accounts.primary);
+    pollAccountSource = "cron-config.json accounts.primary";
+  }
+
+  let telegramTarget = "";
+  let telegramTargetSource = "none";
+  if (options.target) {
+    telegramTarget = String(options.target);
+    telegramTargetSource = "--target";
+  } else if (env.STATE_TELEGRAM_TARGET) {
+    telegramTarget = String(env.STATE_TELEGRAM_TARGET);
+    telegramTargetSource = "STATE_TELEGRAM_TARGET";
+  } else if (cronInfo.config?.telegram?.ajId) {
+    telegramTarget = String(cronInfo.config.telegram.ajId);
+    telegramTargetSource = "cron-config.json telegram.ajId";
+  } else if (cronInfo.config?.telegram?.defaultTarget) {
+    telegramTarget = String(cronInfo.config.telegram.defaultTarget);
+    telegramTargetSource = "cron-config.json telegram.defaultTarget";
+  }
+
+  const pollAccountCheck = pollAccount
+    ? {
+      status: "ok",
+      source: pollAccountSource,
+      value: pollAccount,
+      message: "poll account resolved",
+      fix: null
+    }
+    : {
+      status: "warn",
+      source: "none",
+      value: null,
+      message: "poll account not configured",
+      fix: "Set STATE_GOG_ACCOUNT or add cron-config.json accounts.gogAccount."
+    };
+  if (pollAccountCheck.fix) {
+    addFix(pollAccountCheck.fix);
+  }
+
+  const telegramTargetCheck = telegramTarget
+    ? {
+      status: "ok",
+      source: telegramTargetSource,
+      value: telegramTarget,
+      message: "telegram target resolved",
+      fix: null
+    }
+    : {
+      status: "warn",
+      source: "none",
+      value: null,
+      message: "telegram target not configured",
+      fix: "Set STATE_TELEGRAM_TARGET or add cron-config.json telegram.ajId/defaultTarget."
+    };
+  if (telegramTargetCheck.fix) {
+    addFix(telegramTargetCheck.fix);
+  }
+
+  let cronCheck;
+  if (cronInfo.status === "ok") {
+    cronCheck = {
+      status: "ok",
+      path: cronInfo.path,
+      message: "cron-config.json loaded",
+      fix: null
+    };
+  } else if (cronInfo.status === "missing") {
+    const needsCronFallback = !pollAccount && !telegramTarget;
+    cronCheck = {
+      status: needsCronFallback ? "warn" : "ok",
+      path: cronInfo.path,
+      message: needsCronFallback
+        ? "cron-config.json missing and no env overrides resolved"
+        : "cron-config.json missing (env/flags provide required runtime config)",
+      fix: needsCronFallback
+        ? "Create cron-config.json with accounts.gogAccount and telegram.ajId (or set env vars)."
+        : null
+    };
+  } else {
+    cronCheck = {
+      status: "warn",
+      path: cronInfo.path,
+      message: `cron-config.json is invalid JSON: ${cronInfo.error}`,
+      fix: `Fix JSON syntax in ${cronInfo.path}`
+    };
+  }
+  if (cronCheck.fix) {
+    addFix(cronCheck.fix);
+  }
+
+  const checks = {
+    schemas: {
+      status: aggregateStatuses(schemaChecks.map((item) => item.status)),
+      items: schemaChecks
+    },
+    canonical_files: {
+      status: aggregateStatuses(canonicalChecks.map((item) => item.status)),
+      items: canonicalChecks
+    },
+    binaries: {
+      status: aggregateStatuses(binaryChecks.map((item) => item.status)),
+      items: binaryChecks
+    },
+    cron_config: cronCheck,
+    poll_account: pollAccountCheck,
+    telegram_target: telegramTargetCheck
+  };
+
+  const checkStatuses = Object.values(checks).map((check) => check.status);
+  const rawStatus = aggregateStatuses(checkStatuses);
+  const status = rawStatus === "warn" ? "degraded" : rawStatus;
+
+  return {
+    status,
+    root: rootDir,
+    checks,
+    summary: {
+      ok_checks: checkStatuses.filter((item) => item === "ok").length,
+      warn_checks: checkStatuses.filter((item) => item === "warn").length,
+      error_checks: checkStatuses.filter((item) => item === "error").length
+    },
+    fixes
+  };
+}
+
 function listPendingConfirmations(rootDir, entityId) {
   const state = loadState(rootDir);
   const all = Object.values(state.pending_confirmations);
@@ -1790,6 +2175,7 @@ function usage() {
     "  init [--root <path>]",
     "  status [--root <path>]",
     "  health [--root <path>]",
+    "  doctor [--root <path>] [--account <email>] [--target <telegram-id>]",
     `  migrate [--root <path>] [--entity-id ${DEFAULT_ENTITY_ID}] [--force-commit]`,
     "  ingest --file <observation.json> [--root <path>] [--force-commit]",
     "  extract --entity-id <id> --domain <domain> --text <text> --source-type <type> --source-ref <ref> [--field <field>] [--ingest] [--root <path>]",
@@ -1824,6 +2210,15 @@ function main(argv) {
     if (cmd === "status" || cmd === "health") {
       printJson({ status: "ok", ...getStatus(rootDir) });
       return 0;
+    }
+
+    if (cmd === "doctor") {
+      const report = getDoctorReport(rootDir, {
+        account: args.account || "",
+        target: args.target || ""
+      });
+      printJson(report);
+      return report.status === "error" ? 1 : 0;
     }
 
     if (cmd === "migrate") {
@@ -2029,6 +2424,7 @@ module.exports = {
   gmailThreadsToSignal,
   getPendingConfirmation,
   getStatus,
+  getDoctorReport,
   getDlqSummary,
   ingestObservation,
   ingestSignalEvent,
