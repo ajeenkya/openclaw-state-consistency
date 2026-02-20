@@ -1,0 +1,41 @@
+{
+  "name": "openclaw-state-consistency",
+  "version": "1.0.0",
+  "description": "Canonical state consistency engine for OpenClaw agents (single-writer store, schema-validated ingestion, deterministic projections, and Telegram review loop).",
+  "type": "commonjs",
+  "main": "scripts/state-consistency.js",
+  "scripts": {
+    "test": "node --test test/**/*.test.js",
+    "state:init": "node scripts/state-consistency.js init",
+    "state:status": "node scripts/state-consistency.js status",
+    "state:migrate": "node scripts/migrate-state-to-canonical.js",
+    "state:project": "node scripts/state-consistency.js project",
+    "state:pending": "node scripts/state-consistency.js pending",
+    "state:poll": "node scripts/state-consistency.js poll --project",
+    "state:review-queue": "node scripts/state-consistency.js review-queue --project",
+    "state:poller:run": "node scripts/state-poller-runner.js",
+    "state:poller:install-cron": "bash scripts/state-install-poller-cron.sh",
+    "state:poller:uninstall-cron": "bash scripts/state-uninstall-poller-cron.sh",
+    "state:telegram-review:run": "node scripts/state-telegram-review.js",
+    "state:telegram-review:install-cron": "bash scripts/state-install-telegram-review-cron.sh",
+    "state:telegram-review:uninstall-cron": "bash scripts/state-uninstall-telegram-review-cron.sh",
+    "state:telegram-review:install-launchd": "bash scripts/state-install-telegram-review-launchd.sh",
+    "state:telegram-review:uninstall-launchd": "bash scripts/state-uninstall-telegram-review-launchd.sh"
+  },
+  "keywords": [
+    "openclaw",
+    "state-consistency",
+    "agent-memory",
+    "json-schema",
+    "telegram"
+  ],
+  "author": "Ajeenkya Bhatalkar",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "ajv": "^8.18.0",
+    "ajv-formats": "^3.0.1"
+  }
+}

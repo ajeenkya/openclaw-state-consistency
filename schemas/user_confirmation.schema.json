@@ -1,0 +1,114 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://openclaw.local/schemas/user_confirmation.schema.json",
+  "title": "UserConfirmation",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "prompt_id",
+    "entity_id",
+    "domain",
+    "proposed_change",
+    "confidence",
+    "reason_summary",
+    "action"
+  ],
+  "properties": {
+    "prompt_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "entity_id": {
+      "type": "string",
+      "pattern": "^(user|family|team):[a-z0-9._-]+$",
+      "minLength": 3,
+      "maxLength": 80
+    },
+    "domain": {
+      "type": "string",
+      "enum": [
+        "travel",
+        "family",
+        "project",
+        "financial",
+        "profile",
+        "school",
+        "general"
+      ]
+    },
+    "proposed_change": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 400
+    },
+    "confidence": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "reason_summary": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 5,
+      "items": {
+        "type": "string",
+        "minLength": 3,
+        "maxLength": 160
+      }
+    },
+    "action": {
+      "type": "string",
+      "enum": [
+        "confirm",
+        "reject",
+        "edit"
+      ]
+    },
+    "edited_value": {
+      "oneOf": [
+        {
+          "type": "string",
+          "maxLength": 5000
+        },
+        {
+          "type": "number"
+        },
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "null"
+        },
+        {
+          "type": "array"
+        },
+        {
+          "type": "object"
+        }
+      ]
+    },
+    "ts": {
+      "type": "string",
+      "format": "date-time"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "const": "edit"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "edited_value": {}
+        },
+        "required": [
+          "edited_value"
+        ]
+      }
+    }
+  ]
+}

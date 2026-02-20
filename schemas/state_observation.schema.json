@@ -1,0 +1,143 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://openclaw.local/schemas/state_observation.schema.json",
+  "title": "StateObservation",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "event_id",
+    "event_ts",
+    "domain",
+    "entity_id",
+    "field",
+    "candidate_value",
+    "intent",
+    "source"
+  ],
+  "properties": {
+    "event_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "event_ts": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "domain": {
+      "type": "string",
+      "enum": [
+        "travel",
+        "family",
+        "project",
+        "financial",
+        "profile",
+        "school",
+        "general"
+      ]
+    },
+    "entity_id": {
+      "type": "string",
+      "pattern": "^(user|family|team):[a-z0-9._-]+$",
+      "minLength": 3,
+      "maxLength": 80
+    },
+    "field": {
+      "type": "string",
+      "pattern": "^[a-z0-9_.-]+$",
+      "minLength": 3,
+      "maxLength": 100
+    },
+    "candidate_value": {
+      "oneOf": [
+        {
+          "type": "string",
+          "maxLength": 5000
+        },
+        {
+          "type": "number"
+        },
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "null"
+        },
+        {
+          "type": "array"
+        },
+        {
+          "type": "object"
+        }
+      ]
+    },
+    "intent": {
+      "type": "string",
+      "enum": [
+        "assertive",
+        "planning",
+        "hypothetical",
+        "historical",
+        "retract"
+      ]
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "ref"
+      ],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            "conversation_assertive",
+            "conversation_planning",
+            "calendar_poll",
+            "calendar_webhook",
+            "email_poll",
+            "email_webhook",
+            "transactions_email",
+            "static_markdown",
+            "manual_markdown",
+            "system_migration",
+            "user_confirmation"
+          ]
+        },
+        "ref": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 300
+        }
+      }
+    },
+    "corroborators": {
+      "type": "array",
+      "maxItems": 10,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "type",
+          "ref"
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "minLength": 2,
+            "maxLength": 60
+          },
+          "ref": {
+            "type": "string",
+            "minLength": 2,
+            "maxLength": 300
+          }
+        }
+      }
+    },
+    "meta": {
+      "type": "object",
+      "additionalProperties": true
+    }
+  }
+}
