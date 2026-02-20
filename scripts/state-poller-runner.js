@@ -9,7 +9,8 @@ const DEFAULT_ENTITY_ID = "user:primary";
 const {
   pollSignals,
   promoteReviewQueue,
-  renderHeartbeatProjection
+  renderHeartbeatProjection,
+  runAdaptiveThresholdLearning
 } = require("./state-consistency");
 
 function readCronConfig(rootDir) {
@@ -49,6 +50,15 @@ function main(argv) {
     });
 
     const projection = renderHeartbeatProjection(rootDir, { entity_id: entityId });
+    let adaptive;
+    try {
+      adaptive = runAdaptiveThresholdLearning(rootDir, {});
+    } catch (error) {
+      adaptive = {
+        status: "error",
+        message: error.message
+      };
+    }
 
     process.stdout.write(
       `${JSON.stringify({
@@ -58,7 +68,8 @@ function main(argv) {
         account: account || null,
         poll,
         review,
-        projection
+        projection,
+        adaptive
       }, null, 2)}\n`
     );
     return 0;

@@ -15,6 +15,7 @@
     "state:health": "node scripts/state-consistency.js health",
     "state:doctor": "node scripts/state-consistency.js doctor",
     "state:retry-dlq": "node scripts/state-consistency.js retry-dlq",
+    "state:learn": "node scripts/state-consistency.js learn-thresholds",
     "state:migrate": "node scripts/migrate-state-to-canonical.js",
     "state:project": "node scripts/state-consistency.js project",
     "state:pending": "node scripts/state-consistency.js pending",

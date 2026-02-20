@@ -18,7 +18,8 @@ const {
   migrateToCanonical,
   promoteReviewQueue,
   retryDlqEntries,
-  extractObservationFromText
+  extractObservationFromText,
+  runAdaptiveThresholdLearning
 } = require("../scripts/state-consistency");
 
 function mkWorkspace() {
@@ -80,6 +81,11 @@ function writeShellScript(filePath, body) {
   return filePath;
 }
 
+function makeUuid(index) {
+  const tail = String(index).padStart(12, "0");
+  return `00000000-0000-4000-8000-${tail}`;
+}
+
 test("init creates state files and status baseline", () => {
   const rootDir = mkWorkspace();
   ensureStateFiles(rootDir);
@@ -90,6 +96,7 @@ test("init creates state files and status baseline", () => {
   assert.ok(fs.existsSync(path.join(rootDir, "memory", "state-tracker.json")));
   assert.ok(fs.existsSync(path.join(rootDir, "memory", "state-changes.md")));
   assert.ok(fs.existsSync(path.join(rootDir, "memory", "state-dlq.jsonl")));
+  assert.ok(fs.existsSync(path.join(rootDir, "memory", "state-learning-events.jsonl")));
 });
 
 test("ingestion commits high-confidence events and enforces idempotency", () => {
@@ -326,6 +333,125 @@ test("signal item ref keeps poll ingestion idempotent across runs", () => {
   assert.equal(first.status, "ok");
   assert.equal(second.status, "ok");
   assert.equal(second.duplicate, 1);
+});
+
+test("adaptive learning shadow mode computes recommendations without mutating thresholds", () => {
+  const rootDir = mkWorkspace();
+  ensureStateFiles(rootDir);
+
+  for (let i = 0; i < 16; i += 1) {
+    const ingested = ingestObservation(rootDir, {
+      event_id: makeUuid(100 + i),
+      event_ts: new Date().toISOString(),
+      domain: "general",
+      entity_id: "user:primary",
+      field: `general.adaptive_shadow_${i}`,
+      candidate_value: `Adaptive sample ${i}`,
+      intent: "assertive",
+      source: {
+        type: "conversation_assertive",
+        ref: `thread:adaptive-shadow:${i}`
+      },
+      corroborators: []
+    });
+    assert.equal(ingested.status, "pending_confirmation");
+    const action = i < 9 ? "confirm" : "reject";
+    const confirmation = {
+      prompt_id: ingested.prompt.prompt_id,
+      entity_id: "user:primary",
+      domain: "general",
+      proposed_change: ingested.prompt.proposed_change,
+      confidence: ingested.prompt.confidence,
+      reason_summary: ingested.prompt.reason_summary,
+      action,
+      ts: new Date().toISOString()
+    };
+    const applied = applyUserConfirmation(rootDir, confirmation);
+    assert.ok(["committed", "rejected"].includes(applied.status));
+  }
+
+  const before = loadState(rootDir);
+  const beforeAsk = before.domains.general.ask_threshold;
+  const beforeAuto = before.domains.general.auto_threshold;
+
+  const learned = runAdaptiveThresholdLearning(rootDir, {
+    mode: "shadow",
+    min_samples: 12,
+    lookback_days: 30,
+    force: true,
+    persist_config: true
+  });
+
+  assert.equal(learned.status, "ok");
+  assert.equal(learned.mode, "shadow");
+  assert.equal(learned.domains.general.status, "ok");
+  assert.equal(learned.domains_recommended >= 1, true);
+
+  const after = loadState(rootDir);
+  assert.equal(after.domains.general.ask_threshold, beforeAsk);
+  assert.equal(after.domains.general.auto_threshold, beforeAuto);
+  assert.equal(after.runtime.adaptive_learning.mode, "shadow");
+  assert.equal(after.runtime.adaptive_learning_enabled, false);
+});
+
+test("adaptive learning apply mode updates thresholds within bounds", () => {
+  const rootDir = mkWorkspace();
+  ensureStateFiles(rootDir);
+
+  for (let i = 0; i < 18; i += 1) {
+    const ingested = ingestObservation(rootDir, {
+      event_id: makeUuid(300 + i),
+      event_ts: new Date().toISOString(),
+      domain: "general",
+      entity_id: "user:primary",
+      field: `general.adaptive_apply_${i}`,
+      candidate_value: `Adaptive apply sample ${i}`,
+      intent: "assertive",
+      source: {
+        type: "conversation_assertive",
+        ref: `thread:adaptive-apply:${i}`
+      },
+      corroborators: []
+    });
+    assert.equal(ingested.status, "pending_confirmation");
+    const action = i < 8 ? "confirm" : "reject";
+    const confirmation = {
+      prompt_id: ingested.prompt.prompt_id,
+      entity_id: "user:primary",
+      domain: "general",
+      proposed_change: ingested.prompt.proposed_change,
+      confidence: ingested.prompt.confidence,
+      reason_summary: ingested.prompt.reason_summary,
+      action,
+      ts: new Date().toISOString()
+    };
+    const applied = applyUserConfirmation(rootDir, confirmation);
+    assert.ok(["committed", "rejected"].includes(applied.status));
+  }
+
+  const before = loadState(rootDir);
+  const beforeAuto = before.domains.general.auto_threshold;
+
+  const learned = runAdaptiveThresholdLearning(rootDir, {
+    mode: "apply",
+    min_samples: 12,
+    lookback_days: 30,
+    max_daily_step: 0.03,
+    force: true,
+    persist_config: true
+  });
+
+  assert.equal(learned.status, "ok");
+  assert.equal(learned.mode, "apply");
+  assert.equal(learned.domains.general.status, "ok");
+
+  const after = loadState(rootDir);
+  assert.equal(after.runtime.adaptive_learning.mode, "apply");
+  assert.equal(after.runtime.adaptive_learning_enabled, true);
+  assert.ok(after.domains.general.auto_threshold >= beforeAuto);
+  assert.ok(after.domains.general.auto_threshold <= 0.99);
+  assert.ok(after.domains.general.ask_threshold >= 0.55);
+  assert.ok(after.domains.general.ask_threshold <= 0.8);
 });
 
 test("structured intent extraction uses command output when schema-valid", () => {

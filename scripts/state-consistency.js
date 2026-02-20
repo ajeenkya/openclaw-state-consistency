@@ -90,6 +90,26 @@ const VALID_DOMAINS = Object.keys(DOMAIN_DEFAULTS);
 const VALID_INTENTS = Object.keys(INTENT_FACTORS);
 const INTENT_EXTRACTOR_MODE_RULE = "rule";
 const INTENT_EXTRACTOR_MODE_COMMAND = "command";
+const ADAPTIVE_MODE_OFF = "off";
+const ADAPTIVE_MODE_SHADOW = "shadow";
+const ADAPTIVE_MODE_APPLY = "apply";
+const THRESHOLD_BOUNDS = {
+  ask_min: 0.55,
+  ask_max: 0.8,
+  auto_min: 0.8,
+  auto_max: 0.99,
+  min_gap: 0.08
+};
+const ADAPTIVE_DEFAULTS = {
+  mode: ADAPTIVE_MODE_OFF,
+  min_samples: 12,
+  lookback_days: 14,
+  max_daily_step: 0.02,
+  target_correction_rate: 0.08,
+  low_confirmation_rate: 0.55,
+  high_confirmation_rate: 0.85,
+  min_interval_hours: 20
+};
 
 function nowIso() {
   return new Date().toISOString();
@@ -121,6 +141,59 @@ function clamp(value, min, max) {
 
 function round3(value) {
   return Math.round(value * 1000) / 1000;
+}
+
+function parseFiniteNumber(value, fallback) {
+  const num = Number(value);
+  if (!Number.isFinite(num)) {
+    return fallback;
+  }
+  return num;
+}
+
+function normalizeAdaptiveMode(value) {
+  const mode = String(value || "").trim().toLowerCase();
+  if (mode === ADAPTIVE_MODE_SHADOW || mode === ADAPTIVE_MODE_APPLY) {
+    return mode;
+  }
+  return ADAPTIVE_MODE_OFF;
+}
+
+function percentile(values, p) {
+  if (!Array.isArray(values) || values.length === 0) {
+    return 0;
+  }
+  const sorted = [...values]
+    .map((value) => Number(value))
+    .filter((value) => Number.isFinite(value))
+    .sort((a, b) => a - b);
+  if (sorted.length === 0) {
+    return 0;
+  }
+  const idx = clamp(p, 0, 1) * (sorted.length - 1);
+  const lo = Math.floor(idx);
+  const hi = Math.ceil(idx);
+  if (lo === hi) {
+    return sorted[lo];
+  }
+  const weight = idx - lo;
+  return sorted[lo] * (1 - weight) + sorted[hi] * weight;
+}
+
+function moveToward(current, target, maxStep) {
+  const cur = Number(current);
+  const next = Number(target);
+  const step = Math.max(0, Number(maxStep) || 0);
+  if (!Number.isFinite(cur)) {
+    return next;
+  }
+  if (!Number.isFinite(next) || step === 0) {
+    return cur;
+  }
+  if (Math.abs(next - cur) <= step) {
+    return next;
+  }
+  return cur + Math.sign(next - cur) * step;
 }
 
 function ensureDirForFile(filePath) {
@@ -217,6 +290,7 @@ function getPaths(rootDir) {
     stateTracker: path.join(rootDir, "memory", "state-tracker.json"),
     stateChanges: path.join(rootDir, "memory", "state-changes.md"),
     stateDlq: path.join(rootDir, "memory", "state-dlq.jsonl"),
+    stateLearningEvents: path.join(rootDir, "memory", "state-learning-events.jsonl"),
     schemas: {
       stateObservation: path.join(rootDir, "schemas", "state_observation.schema.json"),
       userConfirmation: path.join(rootDir, "schemas", "user_confirmation.schema.json"),
@@ -351,6 +425,54 @@ function aggregateStatuses(statuses) {
   return "ok";
 }
 
+function createDefaultAdaptiveRuntime() {
+  return {
+    mode: ADAPTIVE_DEFAULTS.mode,
+    min_samples: ADAPTIVE_DEFAULTS.min_samples,
+    lookback_days: ADAPTIVE_DEFAULTS.lookback_days,
+    max_daily_step: ADAPTIVE_DEFAULTS.max_daily_step,
+    target_correction_rate: ADAPTIVE_DEFAULTS.target_correction_rate,
+    low_confirmation_rate: ADAPTIVE_DEFAULTS.low_confirmation_rate,
+    high_confirmation_rate: ADAPTIVE_DEFAULTS.high_confirmation_rate,
+    min_interval_hours: ADAPTIVE_DEFAULTS.min_interval_hours,
+    last_run_at: null,
+    last_applied_at: null,
+    last_summary: null
+  };
+}
+
+function ensureAdaptiveRuntime(runtime) {
+  const merged = {
+    ...createDefaultAdaptiveRuntime(),
+    ...(runtime || {})
+  };
+  merged.mode = normalizeAdaptiveMode(merged.mode);
+  merged.min_samples = Math.max(4, Math.round(parseFiniteNumber(merged.min_samples, ADAPTIVE_DEFAULTS.min_samples)));
+  merged.lookback_days = Math.max(1, Math.round(parseFiniteNumber(merged.lookback_days, ADAPTIVE_DEFAULTS.lookback_days)));
+  merged.max_daily_step = round3(clamp(parseFiniteNumber(merged.max_daily_step, ADAPTIVE_DEFAULTS.max_daily_step), 0.005, 0.2));
+  merged.target_correction_rate = round3(clamp(
+    parseFiniteNumber(merged.target_correction_rate, ADAPTIVE_DEFAULTS.target_correction_rate),
+    0.01,
+    0.4
+  ));
+  merged.low_confirmation_rate = round3(clamp(
+    parseFiniteNumber(merged.low_confirmation_rate, ADAPTIVE_DEFAULTS.low_confirmation_rate),
+    0.2,
+    0.9
+  ));
+  merged.high_confirmation_rate = round3(clamp(
+    parseFiniteNumber(merged.high_confirmation_rate, ADAPTIVE_DEFAULTS.high_confirmation_rate),
+    merged.low_confirmation_rate + 0.05,
+    0.99
+  ));
+  merged.min_interval_hours = round3(clamp(
+    parseFiniteNumber(merged.min_interval_hours, ADAPTIVE_DEFAULTS.min_interval_hours),
+    1,
+    72
+  ));
+  return merged;
+}
+
 function createDefaultState() {
   return {
     version: 1,
@@ -358,6 +480,7 @@ function createDefaultState() {
     runtime: {
       projection_mode: "legacy_string",
       adaptive_learning_enabled: false,
+      adaptive_learning: createDefaultAdaptiveRuntime(),
       projection_hashes: {},
       last_poll_at: null,
       last_review_queue_at: null
@@ -372,7 +495,10 @@ function createDefaultState() {
     learning_stats: {
       auto_commits: 0,
       auto_commit_corrections: 0,
-      ask_user_confirmations: 0
+      ask_user_confirmations: 0,
+      user_confirms: 0,
+      user_rejects: 0,
+      user_edits: 0
     }
   };
 }
@@ -388,6 +514,9 @@ function ensureStateFiles(rootDir) {
   if (!fs.existsSync(paths.stateDlq)) {
     writeText(paths.stateDlq, "");
   }
+  if (!fs.existsSync(paths.stateLearningEvents)) {
+    writeText(paths.stateLearningEvents, "");
+  }
   return paths;
 }
 
@@ -397,10 +526,15 @@ function loadState(rootDir) {
   state.runtime = state.runtime || {
     projection_mode: "legacy_string",
     adaptive_learning_enabled: false,
+    adaptive_learning: createDefaultAdaptiveRuntime(),
     projection_hashes: {},
     last_poll_at: null,
     last_review_queue_at: null
   };
+  state.runtime.adaptive_learning = ensureAdaptiveRuntime(state.runtime.adaptive_learning);
+  state.runtime.adaptive_learning_enabled = Boolean(
+    state.runtime.adaptive_learning_enabled || state.runtime.adaptive_learning.mode === ADAPTIVE_MODE_APPLY
+  );
   state.runtime.projection_hashes = state.runtime.projection_hashes || {};
   if (!Object.prototype.hasOwnProperty.call(state.runtime, "last_poll_at")) {
     state.runtime.last_poll_at = null;
@@ -418,8 +552,17 @@ function loadState(rootDir) {
   state.learning_stats = state.learning_stats || {
     auto_commits: 0,
     auto_commit_corrections: 0,
-    ask_user_confirmations: 0
+    ask_user_confirmations: 0,
+    user_confirms: 0,
+    user_rejects: 0,
+    user_edits: 0
   };
+  state.learning_stats.auto_commits = Number(state.learning_stats.auto_commits || 0);
+  state.learning_stats.auto_commit_corrections = Number(state.learning_stats.auto_commit_corrections || 0);
+  state.learning_stats.ask_user_confirmations = Number(state.learning_stats.ask_user_confirmations || 0);
+  state.learning_stats.user_confirms = Number(state.learning_stats.user_confirms || 0);
+  state.learning_stats.user_rejects = Number(state.learning_stats.user_rejects || 0);
+  state.learning_stats.user_edits = Number(state.learning_stats.user_edits || 0);
   return state;
 }
 
@@ -432,6 +575,314 @@ function saveState(rootDir, state) {
 function logStateChange(rootDir, line) {
   const paths = getPaths(rootDir);
   appendLine(paths.stateChanges, `- ${nowIso()} | ${line}`);
+}
+
+function appendLearningEvent(rootDir, event) {
+  const paths = getPaths(rootDir);
+  const ts = parseIsoMaybe(event.ts) || nowIso();
+  const record = {
+    learning_event_id: event.learning_event_id || randomUuid(),
+    ts,
+    entity_id: event.entity_id || DEFAULT_ENTITY_ID,
+    domain: VALID_DOMAINS.includes(event.domain) ? event.domain : "general",
+    field: String(event.field || ""),
+    decision: String(event.decision || "ask_user"),
+    action: String(event.action || ""),
+    outcome: String(event.outcome || ""),
+    confidence: round3(clamp(parseFiniteNumber(event.confidence, 0), 0, 1)),
+    intent: VALID_INTENTS.includes(event.intent) ? event.intent : "historical",
+    source_type: String(event.source_type || ""),
+    source_ref: String(event.source_ref || ""),
+    prompt_id: String(event.prompt_id || ""),
+    meta: event.meta && typeof event.meta === "object" ? event.meta : {}
+  };
+  appendLine(paths.stateLearningEvents, JSON.stringify(record));
+  return record;
+}
+
+function loadLearningEvents(rootDir, options = {}) {
+  const paths = ensureStateFiles(rootDir);
+  const lookbackDays = Math.max(1, Math.round(parseFiniteNumber(options.lookback_days, ADAPTIVE_DEFAULTS.lookback_days)));
+  const cutoffMs = Date.now() - lookbackDays * 24 * 60 * 60 * 1000;
+  const text = readTextIfExists(paths.stateLearningEvents, "");
+  const lines = text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  const events = [];
+  let malformedLines = 0;
+  for (const line of lines) {
+    let parsed;
+    try {
+      parsed = JSON.parse(line);
+    } catch (_error) {
+      malformedLines += 1;
+      continue;
+    }
+    if (!parsed || typeof parsed !== "object") {
+      malformedLines += 1;
+      continue;
+    }
+    const ts = parseIsoMaybe(parsed.ts);
+    if (!ts) {
+      malformedLines += 1;
+      continue;
+    }
+    const tsMs = Date.parse(ts);
+    if (!Number.isFinite(tsMs) || tsMs < cutoffMs) {
+      continue;
+    }
+    const domain = VALID_DOMAINS.includes(parsed.domain) ? parsed.domain : "general";
+    events.push({
+      ...parsed,
+      ts,
+      domain,
+      confidence: round3(clamp(parseFiniteNumber(parsed.confidence, 0), 0, 1))
+    });
+  }
+
+  events.sort((a, b) => String(a.ts).localeCompare(String(b.ts)));
+  return {
+    events,
+    malformed_lines: malformedLines,
+    lookback_days: lookbackDays,
+    total_lines: lines.length
+  };
+}
+
+function resolveAdaptiveLearningConfig(state, options = {}) {
+  const env = options.env || process.env;
+  const runtime = ensureAdaptiveRuntime(state?.runtime?.adaptive_learning);
+  const resolved = ensureAdaptiveRuntime({
+    ...runtime,
+    mode: options.mode || env.STATE_ADAPTIVE_MODE || runtime.mode,
+    min_samples: options.min_samples ?? env.STATE_ADAPTIVE_MIN_SAMPLES ?? runtime.min_samples,
+    lookback_days: options.lookback_days ?? env.STATE_ADAPTIVE_LOOKBACK_DAYS ?? runtime.lookback_days,
+    max_daily_step: options.max_daily_step ?? env.STATE_ADAPTIVE_MAX_STEP ?? runtime.max_daily_step,
+    target_correction_rate: options.target_correction_rate ?? env.STATE_ADAPTIVE_TARGET_CORRECTION_RATE ?? runtime.target_correction_rate,
+    low_confirmation_rate: options.low_confirmation_rate ?? env.STATE_ADAPTIVE_LOW_CONFIRM_RATE ?? runtime.low_confirmation_rate,
+    high_confirmation_rate: options.high_confirmation_rate ?? env.STATE_ADAPTIVE_HIGH_CONFIRM_RATE ?? runtime.high_confirmation_rate,
+    min_interval_hours: options.min_interval_hours ?? env.STATE_ADAPTIVE_MIN_INTERVAL_HOURS ?? runtime.min_interval_hours
+  });
+  return resolved;
+}
+
+function computeAdaptiveDomainProposal(domainCfg, events, config) {
+  const sampleCount = events.length;
+  const confirmEvents = events.filter((item) => item.action === "confirm");
+  const correctionEvents = events.filter((item) => item.action === "reject" || item.action === "edit");
+  const confirmationRate = sampleCount > 0 ? confirmEvents.length / sampleCount : 0;
+  const correctionRate = sampleCount > 0 ? correctionEvents.length / sampleCount : 0;
+
+  const currentAsk = parseFiniteNumber(domainCfg.ask_threshold, DOMAIN_DEFAULTS.general.ask_threshold);
+  const currentAuto = parseFiniteNumber(domainCfg.auto_threshold, DOMAIN_DEFAULTS.general.auto_threshold);
+
+  let candidateAuto = currentAuto;
+  if (correctionRate > config.target_correction_rate) {
+    candidateAuto += config.max_daily_step;
+  } else if (
+    correctionRate < config.target_correction_rate / 2 &&
+    confirmationRate >= config.high_confirmation_rate
+  ) {
+    candidateAuto -= config.max_daily_step * 0.5;
+  }
+
+  const correctionConfidences = correctionEvents
+    .map((item) => parseFiniteNumber(item.confidence, NaN))
+    .filter((value) => Number.isFinite(value));
+  if (correctionConfidences.length >= 3) {
+    candidateAuto = Math.max(candidateAuto, percentile(correctionConfidences, 0.75) + 0.01);
+  }
+  candidateAuto = clamp(candidateAuto, THRESHOLD_BOUNDS.auto_min, THRESHOLD_BOUNDS.auto_max);
+
+  let candidateAsk = currentAsk;
+  if (confirmationRate < config.low_confirmation_rate) {
+    candidateAsk += config.max_daily_step;
+  } else if (confirmationRate > config.high_confirmation_rate) {
+    candidateAsk -= config.max_daily_step;
+  }
+  candidateAsk = Math.min(candidateAsk, candidateAuto - THRESHOLD_BOUNDS.min_gap);
+  candidateAsk = clamp(candidateAsk, THRESHOLD_BOUNDS.ask_min, THRESHOLD_BOUNDS.ask_max);
+  if (candidateAsk > candidateAuto - THRESHOLD_BOUNDS.min_gap) {
+    candidateAsk = Math.max(THRESHOLD_BOUNDS.ask_min, candidateAuto - THRESHOLD_BOUNDS.min_gap);
+  }
+
+  let nextAuto = moveToward(currentAuto, candidateAuto, config.max_daily_step);
+  let nextAsk = moveToward(currentAsk, candidateAsk, config.max_daily_step);
+
+  nextAuto = clamp(nextAuto, THRESHOLD_BOUNDS.auto_min, THRESHOLD_BOUNDS.auto_max);
+  nextAsk = clamp(nextAsk, THRESHOLD_BOUNDS.ask_min, THRESHOLD_BOUNDS.ask_max);
+  if (nextAsk > nextAuto - THRESHOLD_BOUNDS.min_gap) {
+    nextAsk = Math.max(THRESHOLD_BOUNDS.ask_min, nextAuto - THRESHOLD_BOUNDS.min_gap);
+  }
+
+  nextAuto = round3(nextAuto);
+  nextAsk = round3(nextAsk);
+
+  return {
+    sample_count: sampleCount,
+    confirm_count: confirmEvents.length,
+    correction_count: correctionEvents.length,
+    confirmation_rate: round3(confirmationRate),
+    correction_rate: round3(correctionRate),
+    current_ask_threshold: round3(currentAsk),
+    current_auto_threshold: round3(currentAuto),
+    proposed_ask_threshold: round3(candidateAsk),
+    proposed_auto_threshold: round3(candidateAuto),
+    next_ask_threshold: nextAsk,
+    next_auto_threshold: nextAuto,
+    changed: nextAsk !== round3(currentAsk) || nextAuto !== round3(currentAuto)
+  };
+}
+
+function runAdaptiveThresholdLearning(rootDir, options = {}) {
+  ensureStateFiles(rootDir);
+  const state = loadState(rootDir);
+  const config = resolveAdaptiveLearningConfig(state, options);
+  const force = Boolean(options.force);
+  const persistConfig = Boolean(options.persist_config);
+  const now = nowIso();
+  const runtimeAdaptive = ensureAdaptiveRuntime({
+    ...state.runtime.adaptive_learning,
+    ...config
+  });
+
+  const lastRunMs = Date.parse(runtimeAdaptive.last_run_at || "");
+  const minIntervalMs = config.min_interval_hours * 60 * 60 * 1000;
+  if (
+    !force &&
+    config.mode !== ADAPTIVE_MODE_OFF &&
+    Number.isFinite(lastRunMs) &&
+    Date.now() - lastRunMs < minIntervalMs
+  ) {
+    if (persistConfig) {
+      state.runtime.adaptive_learning = {
+        ...runtimeAdaptive,
+        mode: config.mode
+      };
+      state.runtime.adaptive_learning_enabled = config.mode === ADAPTIVE_MODE_APPLY;
+      saveState(rootDir, state);
+    }
+    return {
+      status: "skipped",
+      reason: "interval_not_elapsed",
+      mode: config.mode,
+      min_interval_hours: config.min_interval_hours,
+      last_run_at: runtimeAdaptive.last_run_at,
+      config_persisted: persistConfig
+    };
+  }
+
+  if (config.mode === ADAPTIVE_MODE_OFF && !force) {
+    if (persistConfig) {
+      state.runtime.adaptive_learning = {
+        ...runtimeAdaptive,
+        mode: config.mode
+      };
+      state.runtime.adaptive_learning_enabled = false;
+      saveState(rootDir, state);
+    }
+    return {
+      status: "skipped",
+      reason: "mode_off",
+      mode: config.mode,
+      config_persisted: persistConfig
+    };
+  }
+
+  const learning = loadLearningEvents(rootDir, { lookback_days: config.lookback_days });
+  const labeledEvents = learning.events.filter((event) => (
+    event.decision === "ask_user" &&
+    ["confirm", "reject", "edit"].includes(event.action)
+  ));
+
+  const byDomain = new Map();
+  for (const event of labeledEvents) {
+    const domain = VALID_DOMAINS.includes(event.domain) ? event.domain : "general";
+    if (!byDomain.has(domain)) {
+      byDomain.set(domain, []);
+    }
+    byDomain.get(domain).push(event);
+  }
+
+  const summary = {
+    status: "ok",
+    mode: config.mode,
+    run_at: now,
+    lookback_days: config.lookback_days,
+    min_samples: config.min_samples,
+    max_daily_step: config.max_daily_step,
+    target_correction_rate: config.target_correction_rate,
+    events_considered: labeledEvents.length,
+    malformed_lines: learning.malformed_lines,
+    domains_updated: 0,
+    domains_recommended: 0,
+    applied: false,
+    domains: {}
+  };
+
+  for (const domain of VALID_DOMAINS) {
+    const domainEvents = byDomain.get(domain) || [];
+    if (domainEvents.length < config.min_samples) {
+      summary.domains[domain] = {
+        status: "insufficient_samples",
+        sample_count: domainEvents.length,
+        min_samples: config.min_samples
+      };
+      continue;
+    }
+
+    const proposal = computeAdaptiveDomainProposal(
+      state.domains[domain] || DOMAIN_DEFAULTS.general,
+      domainEvents,
+      config
+    );
+    summary.domains[domain] = {
+      status: "ok",
+      ...proposal
+    };
+
+    if (!proposal.changed) {
+      continue;
+    }
+
+    if (config.mode === ADAPTIVE_MODE_APPLY) {
+      state.domains[domain] = state.domains[domain] || { ...DOMAIN_DEFAULTS.general };
+      state.domains[domain].ask_threshold = proposal.next_ask_threshold;
+      state.domains[domain].auto_threshold = proposal.next_auto_threshold;
+      summary.domains_updated += 1;
+      logStateChange(
+        rootDir,
+        `adaptive_threshold_update | domain=${domain} | ask=${proposal.current_ask_threshold}->${proposal.next_ask_threshold} | auto=${proposal.current_auto_threshold}->${proposal.next_auto_threshold} | correction_rate=${proposal.correction_rate}`
+      );
+    } else {
+      summary.domains_recommended += 1;
+    }
+  }
+
+  state.runtime.adaptive_learning = {
+    ...runtimeAdaptive,
+    mode: config.mode,
+    last_run_at: now,
+    last_applied_at: config.mode === ADAPTIVE_MODE_APPLY && summary.domains_updated > 0
+      ? now
+      : runtimeAdaptive.last_applied_at || null,
+    last_summary: {
+      status: summary.status,
+      mode: summary.mode,
+      run_at: summary.run_at,
+      events_considered: summary.events_considered,
+      malformed_lines: summary.malformed_lines,
+      domains_updated: summary.domains_updated,
+      domains_recommended: summary.domains_recommended
+    }
+  };
+  state.runtime.adaptive_learning_enabled = config.mode === ADAPTIVE_MODE_APPLY;
+  summary.applied = config.mode === ADAPTIVE_MODE_APPLY && summary.domains_updated > 0;
+  saveState(rootDir, state);
+
+  return summary;
 }
 
 function pushProcessedEventId(state, eventId) {
@@ -982,12 +1433,33 @@ function applyUserConfirmation(rootDir, confirmation) {
     };
   }
 
+  const confirmationTs = confirmation.ts || nowIso();
+  const pendingObservation = pending.observation_event || {};
+  const learningEventBase = {
+    ts: confirmationTs,
+    entity_id: pending.entity_id,
+    domain: pending.domain,
+    field: pendingObservation.field || "",
+    decision: "ask_user",
+    confidence: pending.confidence,
+    intent: pendingObservation.intent || "assertive",
+    source_type: pendingObservation.source?.type || pending.source?.type || "",
+    source_ref: pendingObservation.source?.ref || pending.source?.ref || "",
+    prompt_id: pending.prompt_id
+  };
+
   state.learning_stats.ask_user_confirmations += 1;
   delete state.pending_confirmations[confirmation.prompt_id];
 
   if (confirmation.action === "reject") {
+    state.learning_stats.user_rejects += 1;
     saveState(rootDir, state);
     logStateChange(rootDir, `prompt=${confirmation.prompt_id} | action=reject | no state mutation`);
+    appendLearningEvent(rootDir, {
+      ...learningEventBase,
+      action: "reject",
+      outcome: "corrected"
+    });
     return {
       status: "rejected",
       prompt_id: confirmation.prompt_id
@@ -998,7 +1470,7 @@ function applyUserConfirmation(rootDir, confirmation) {
   const committedObservation = {
     ...baseObservation,
     event_id: randomUuid(),
-    event_ts: confirmation.ts || nowIso(),
+    event_ts: confirmationTs,
     intent: "assertive",
     candidate_value: confirmation.action === "edit" ? confirmation.edited_value : baseObservation.candidate_value,
     source: {
@@ -1019,11 +1491,21 @@ function applyUserConfirmation(rootDir, confirmation) {
 
   const analysis = computeConfidence(state, committedObservation);
   const commitResult = applyCommittedObservation(state, committedObservation, analysis.confidence);
+  if (confirmation.action === "edit") {
+    state.learning_stats.user_edits += 1;
+  } else {
+    state.learning_stats.user_confirms += 1;
+  }
   saveState(rootDir, state);
   logStateChange(
     rootDir,
     `prompt=${confirmation.prompt_id} | action=${confirmation.action} | committed=${committedObservation.entity_id}/${committedObservation.domain}.${commitResult.fieldKey} | value=${stringifyValue(committedObservation.candidate_value)}`
   );
+  appendLearningEvent(rootDir, {
+    ...learningEventBase,
+    action: confirmation.action,
+    outcome: confirmation.action === "confirm" ? "accepted" : "corrected"
+  });
   return {
     status: "committed",
     prompt_id: confirmation.prompt_id,
@@ -1964,6 +2446,7 @@ function getLastReviewTimestamp(rootDir) {
 function getStatus(rootDir) {
   ensureStateFiles(rootDir);
   const state = loadState(rootDir);
+  const adaptive = ensureAdaptiveRuntime(state.runtime.adaptive_learning);
   const entities = Object.keys(state.entities);
   const committedCount = toStableStateEntries(state).length;
   const pendingCount = Object.keys(state.pending_confirmations).length;
@@ -1985,7 +2468,22 @@ function getStatus(rootDir) {
     last_review: lastReview,
     processed_event_ids: state.processed_event_ids.length,
     projection_mode: state.runtime.projection_mode,
-    adaptive_learning_enabled: Boolean(state.runtime.adaptive_learning_enabled)
+    adaptive_learning_enabled: Boolean(state.runtime.adaptive_learning_enabled),
+    adaptive_mode: adaptive.mode,
+    adaptive_last_run: adaptive.last_run_at || null,
+    adaptive_last_applied: adaptive.last_applied_at || null,
+    adaptive: {
+      mode: adaptive.mode,
+      min_samples: adaptive.min_samples,
+      lookback_days: adaptive.lookback_days,
+      max_daily_step: adaptive.max_daily_step,
+      target_correction_rate: adaptive.target_correction_rate,
+      min_interval_hours: adaptive.min_interval_hours,
+      last_run_at: adaptive.last_run_at || null,
+      last_applied_at: adaptive.last_applied_at || null,
+      last_summary: adaptive.last_summary || null
+    },
+    learning_stats: state.learning_stats
   };
 }
 
@@ -2078,6 +2576,12 @@ function getDoctorReport(rootDir, options = {}) {
     {
       name: "state-dlq",
       file: paths.stateDlq,
+      format: "text",
+      missingFix: "Run `npm run state:init` to create canonical state files."
+    },
+    {
+      name: "state-learning-events",
+      file: paths.stateLearningEvents,
       format: "text",
       missingFix: "Run `npm run state:init` to create canonical state files."
     },
@@ -2248,6 +2752,29 @@ function getDoctorReport(rootDir, options = {}) {
     addFix(cronCheck.fix);
   }
 
+  const tracker = readJsonIfExistsSafe(paths.stateTracker, null);
+  const adaptiveRuntime = ensureAdaptiveRuntime(tracker?.runtime?.adaptive_learning);
+  const adaptiveMode = normalizeAdaptiveMode(
+    options.mode ||
+    env.STATE_ADAPTIVE_MODE ||
+    adaptiveRuntime.mode
+  );
+  const adaptiveCheck = {
+    status: "ok",
+    mode: adaptiveMode,
+    last_run_at: adaptiveRuntime.last_run_at || null,
+    message: `adaptive learning mode=${adaptiveMode}`,
+    fix: null
+  };
+  if (adaptiveMode !== ADAPTIVE_MODE_OFF && !adaptiveRuntime.last_run_at) {
+    adaptiveCheck.status = "warn";
+    adaptiveCheck.message = `adaptive learning mode=${adaptiveMode} but no run recorded yet`;
+    adaptiveCheck.fix = "Run `npm run state:learn` once to initialize adaptive learning history.";
+  }
+  if (adaptiveCheck.fix) {
+    addFix(adaptiveCheck.fix);
+  }
+
   const checks = {
     schemas: {
       status: aggregateStatuses(schemaChecks.map((item) => item.status)),
@@ -2263,7 +2790,8 @@ function getDoctorReport(rootDir, options = {}) {
     },
     cron_config: cronCheck,
     poll_account: pollAccountCheck,
-    telegram_target: telegramTargetCheck
+    telegram_target: telegramTargetCheck,
+    adaptive_learning: adaptiveCheck
   };
 
   const checkStatuses = Object.values(checks).map((check) => check.status);
@@ -2340,6 +2868,7 @@ function usage() {
     "  review-queue [--root <path>] [--entity-id <id>] [--domain <domain>] [--min-confidence 0.4] [--limit 5] [--max-pending 10] [--project]",
     "  pending [--root <path>] [--entity-id <id>]",
     "  retry-dlq [--root <path>] [--limit 25] [--max-retries 5] [--include-not-due] [--force-commit] [--project] [--entity-id <id>]",
+    "  learn-thresholds [--root <path>] [--mode off|shadow|apply] [--min-samples 12] [--lookback-days 14] [--max-step 0.02] [--target-correction-rate 0.08] [--min-interval-hours 20] [--force] [--project] [--entity-id <id>]",
     "  confirm --prompt-id <id> --action confirm|reject|edit [--edited-value <json-or-string>] [--root <path>]",
     "  project [--root <path>] [--entity-id <id>]"
   ];
@@ -2514,6 +3043,26 @@ function main(argv) {
       return 0;
     }
 
+    if (cmd === "learn-thresholds" || cmd === "learn") {
+      const result = runAdaptiveThresholdLearning(rootDir, {
+        mode: args.mode || "",
+        min_samples: parseFiniteNumber(args["min-samples"], undefined),
+        lookback_days: parseFiniteNumber(args["lookback-days"], undefined),
+        max_daily_step: parseFiniteNumber(args["max-step"], undefined),
+        target_correction_rate: parseFiniteNumber(args["target-correction-rate"], undefined),
+        low_confirmation_rate: parseFiniteNumber(args["low-confirmation-rate"], undefined),
+        high_confirmation_rate: parseFiniteNumber(args["high-confirmation-rate"], undefined),
+        min_interval_hours: parseFiniteNumber(args["min-interval-hours"], undefined),
+        force: Boolean(args.force),
+        persist_config: true
+      });
+      if (args.project) {
+        renderHeartbeatProjection(rootDir, { entity_id: args["entity-id"] || "" });
+      }
+      printJson(result);
+      return 0;
+    }
+
     if (cmd === "confirm") {
       if (!args["prompt-id"] || !args.action) {
         throw new Error("--prompt-id and --action are required for confirm");
@@ -2583,6 +3132,7 @@ module.exports = {
   getStatus,
   getDoctorReport,
   getDlqSummary,
+  runAdaptiveThresholdLearning,
   ingestObservation,
   ingestSignalEvent,
   pollSignals,

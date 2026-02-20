@@ -38,6 +38,7 @@ npm run state:project
 npm run state:health
 npm run state:doctor
 npm run state:retry-dlq -- --limit 25
+npm run state:learn -- --mode shadow
 npm run state:plugin:install
 npm run lint
 npm run schema:check
@@ -125,10 +126,17 @@ Environment variables:
 - `STATE_INGEST_ALLOWED_SENDERS` (optional csv sender-id allowlist)
 - `STATE_INTENT_EXTRACTOR_MODE` (`rule` default, or `command`)
 - `STATE_INTENT_EXTRACTOR_CMD` (required when mode is `command`; command reads JSON on stdin and must output schema-valid JSON)
+- `STATE_ADAPTIVE_MODE` (`off` default, `shadow`, or `apply`)
+- `STATE_ADAPTIVE_MIN_SAMPLES` (default: `12`)
+- `STATE_ADAPTIVE_LOOKBACK_DAYS` (default: `14`)
+- `STATE_ADAPTIVE_MAX_STEP` (default: `0.02`)
+- `STATE_ADAPTIVE_TARGET_CORRECTION_RATE` (default: `0.08`)
+- `STATE_ADAPTIVE_MIN_INTERVAL_HOURS` (default: `20`)
 
 Structured intent extractor output contract (`schemas/intent_extraction.schema.json`):
 - `{"intent":"assertive|planning|hypothetical|historical|retract","confidence":0..1,"reason":"...","domain":"..."?}`
 - Any command output that fails strict schema validation is rejected and the runtime falls back to deterministic rule-based classification.
+- Adaptive threshold learning consumes confirmation outcomes from `memory/state-learning-events.jsonl` and updates per-domain `ask_threshold`/`auto_threshold` within hard safety bounds.
 
 ## Notes
 
