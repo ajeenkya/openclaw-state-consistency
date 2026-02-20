@@ -83,6 +83,8 @@ The plugin at `plugins/state-consistency-bridge` adds:
 - `before_agent_start` canonical state injection into model context
 - `/state-confirm` command handling (Yes/No button callbacks bypass normal LLM replies)
 - Immediate next-pending prompt handoff with fresh Yes/No buttons
+- `message_received` auto-ingestion of inbound assertions into `StateObservation` events
+- Natural `yes` / `no` replies now auto-apply active pending confirmations (no command prefix required)
 
 The Telegram review dispatcher now sends button callbacks as:
 - `/state-confirm <promptId> yes`
@@ -116,6 +118,11 @@ Environment variables:
 - `STATE_TELEGRAM_TARGET` (required unless provided in `cron-config.json`)
 - `STATE_TELEGRAM_THREAD_ID`
 - `STATE_TELEGRAM_REVIEW_INTERVAL` (launchd)
+- `STATE_INGEST_CHANNELS` (csv, default: `telegram`)
+- `STATE_INGEST_MIN_CHARS` (default: `12`)
+- `STATE_INGEST_MAX_PENDING` (default: `10`)
+- `STATE_INGEST_SOURCE_TYPE` (`conversation_planning` or `conversation_assertive`)
+- `STATE_INGEST_ALLOWED_SENDERS` (optional csv sender-id allowlist)
 
 ## Notes
 

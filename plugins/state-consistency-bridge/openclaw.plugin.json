@@ -22,6 +22,44 @@
         "type": "integer",
         "minimum": 1,
         "maximum": 200
+      },
+      "autoIngestInbound": {
+        "type": "boolean"
+      },
+      "ingestChannels": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "ingestAllowedSenders": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "entityId": {
+        "type": "string"
+      },
+      "ingestSourceType": {
+        "type": "string",
+        "enum": [
+          "conversation_planning",
+          "conversation_assertive"
+        ]
+      },
+      "ingestMinChars": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 500
+      },
+      "ingestMaxPending": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 200
+      },
+      "projectOnIngest": {
+        "type": "boolean"
       }
     }
   },
@@ -45,6 +83,38 @@
     "injectMaxFields": {
       "label": "Max Injected Fields",
       "help": "Maximum committed fields to inject into the context snapshot"
+    },
+    "autoIngestInbound": {
+      "label": "Auto Ingest Inbound",
+      "help": "Convert incoming user assertions into StateObservation events"
+    },
+    "ingestChannels": {
+      "label": "Ingest Channels",
+      "help": "Channels to auto-ingest from (default: telegram). Use '*' for all."
+    },
+    "ingestAllowedSenders": {
+      "label": "Allowed Sender IDs",
+      "help": "Optional sender allowlist for ingestion; empty means all inbound senders"
+    },
+    "entityId": {
+      "label": "Entity ID",
+      "help": "Entity id to write observations to (default: user:primary)"
+    },
+    "ingestSourceType": {
+      "label": "Ingest Source Type",
+      "help": "Source reliability bucket for auto-ingested chat assertions"
+    },
+    "ingestMinChars": {
+      "label": "Ingest Min Chars",
+      "help": "Skip very short messages when auto-ingesting assertions"
+    },
+    "ingestMaxPending": {
+      "label": "Ingest Max Pending",
+      "help": "Stop creating new pending confirmations when this cap is reached"
+    },
+    "projectOnIngest": {
+      "label": "Project On Ingest",
+      "help": "Render deterministic HEARTBEAT projection after auto-ingest"
     }
   }
 }

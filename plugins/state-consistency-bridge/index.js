@@ -1,10 +1,14 @@
 "use strict";
 
+const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 
 const DEFAULT_ENTITY_ID = "user:primary";
 const DEFAULT_INJECT_MAX_FIELDS = 32;
+const DEFAULT_INGEST_MIN_CHARS = 12;
+const DEFAULT_INGEST_MAX_PENDING = 10;
+const DEFAULT_INGEST_SOURCE_TYPE = "conversation_planning";
 
 function nowIso() {
   return new Date().toISOString();
@@ -329,10 +333,238 @@ function loadStateApi(stateScriptPath) {
     throw new Error("state-consistency.js not found");
   }
   const api = require(stateScriptPath);
-  if (typeof api.loadState !== "function" || typeof api.applyUserConfirmation !== "function") {
+  if (
+    typeof api.loadState !== "function" ||
+    typeof api.applyUserConfirmation !== "function" ||
+    typeof api.ingestObservation !== "function"
+  ) {
     throw new Error("state-consistency.js does not expose required functions");
   }
   return api;
+}
+
+function deterministicUuidFromText(text) {
+  const hash = crypto.createHash("md5").update(String(text || ""), "utf8").digest();
+  const bytes = Buffer.from(hash);
+  bytes[6] = (bytes[6] & 0x0f) | 0x50;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = bytes.toString("hex");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
+}
+
+function normalizeInboundText(input) {
+  return String(input || "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function parseNaturalConfirmationAction(input) {
+  const token = normalizeInboundText(input)
+    .toLowerCase()
+    .replace(/[.!]+$/, "");
+
+  if (!token) {
+    return "";
+  }
+  if (["yes", "y", "yep", "yeah", "confirm", "confirmed", "correct", "true"].includes(token)) {
+    return "confirm";
+  }
+  if (["no", "n", "nope", "nah", "reject", "rejected", "incorrect", "false"].includes(token)) {
+    return "reject";
+  }
+  return "";
+}
+
+function parseStringSet(value) {
+  if (Array.isArray(value)) {
+    return new Set(value.map((item) => String(item || "").trim().toLowerCase()).filter(Boolean));
+  }
+  const raw = String(value || "").trim();
+  if (!raw) {
+    return new Set();
+  }
+  return new Set(raw.split(",").map((item) => item.trim().toLowerCase()).filter(Boolean));
+}
+
+function resolveIngestChannels(cfg) {
+  const fromCfg = cfg?.ingestChannels;
+  if (Array.isArray(fromCfg) && fromCfg.length > 0) {
+    return parseStringSet(fromCfg);
+  }
+  const envValue = process.env.STATE_INGEST_CHANNELS || "";
+  if (String(envValue).trim()) {
+    return parseStringSet(envValue);
+  }
+  return new Set(["telegram"]);
+}
+
+function isChannelEnabled(enabledChannels, channelId) {
+  if (!(enabledChannels instanceof Set) || enabledChannels.size === 0) {
+    return true;
+  }
+  if (enabledChannels.has("*")) {
+    return true;
+  }
+  return enabledChannels.has(String(channelId || "").toLowerCase());
+}
+
+function looksLikeSelfMessage(metadata) {
+  const meta = metadata || {};
+  if (meta.fromSelf === true || meta.isSelf === true || meta.isBot === true || meta.senderIsBot === true) {
+    return true;
+  }
+  return false;
+}
+
+function shouldSkipInboundAssertion(text, minChars) {
+  if (!text) {
+    return true;
+  }
+  if (text.startsWith("/")) {
+    return true;
+  }
+  if (text.length < minChars) {
+    return true;
+  }
+  if (!/[a-zA-Z]/.test(text)) {
+    return true;
+  }
+  if (/\?$/.test(text)) {
+    return true;
+  }
+  return false;
+}
+
+function inferDomainFromText(text) {
+  const line = String(text || "");
+  if (/\b(tahoe|trip|travel|flight|northstar|drive|airport|hotel|booking)\b/i.test(line)) {
+    return "travel";
+  }
+  if (/\b(veda|mithila|kids|family|school|class|daycare)\b/i.test(line)) {
+    return "family";
+  }
+  if (/\b(budget|bill|payment|mortgage|credit|monarch|investment|transaction)\b/i.test(line)) {
+    return "financial";
+  }
+  if (/\b(feature|project|deploy|ship|goal|work|airbnb|identity team)\b/i.test(line)) {
+    return "project";
+  }
+  if (/\b(prefer|preference|profile|identity|name|timezone)\b/i.test(line)) {
+    return "profile";
+  }
+  return "general";
+}
+
+function normalizeSourceType(raw) {
+  const value = String(raw || "").trim().toLowerCase();
+  if (value === "conversation_assertive") {
+    return "conversation_assertive";
+  }
+  return DEFAULT_INGEST_SOURCE_TYPE;
+}
+
+function coerceIsoTimestamp(rawTs) {
+  if (typeof rawTs === "number" && Number.isFinite(rawTs)) {
+    const ms = rawTs > 10_000_000_000 ? rawTs : rawTs * 1000;
+    const date = new Date(ms);
+    if (Number.isFinite(date.getTime())) {
+      return date.toISOString();
+    }
+  }
+  return nowIso();
+}
+
+function readInboundMessageId(event) {
+  const metadata = event?.metadata || {};
+  const messageId = (
+    metadata.messageId ||
+    metadata.message_id ||
+    metadata.telegramMessageId ||
+    metadata.id ||
+    ""
+  );
+  return String(messageId || "").trim();
+}
+
+function buildInboundObservation(params) {
+  const { event, ctx, stateApi, entityId, sourceType } = params;
+  const text = normalizeInboundText(event?.content || "");
+  const domain = inferDomainFromText(text);
+  const field = `${domain}.current_assertion`;
+  const channelId = String(ctx?.channelId || "unknown").toLowerCase() || "unknown";
+  const conversationId = String(
+    ctx?.conversationId ||
+    event?.metadata?.threadId ||
+    event?.metadata?.to ||
+    event?.from ||
+    "unknown"
+  );
+  const inboundMessageId = readInboundMessageId(event);
+  const fingerprint = [
+    channelId,
+    conversationId,
+    inboundMessageId || "(no-message-id)",
+    String(event?.from || ""),
+    String(event?.timestamp || ""),
+    text
+  ].join("|");
+  const eventId = deterministicUuidFromText(`state-chat-observation:${fingerprint}`);
+
+  let intent = "historical";
+  try {
+    if (typeof stateApi.classifyIntent === "function") {
+      const classified = stateApi.classifyIntent(text);
+      const nextIntent = String(classified?.intent || "").toLowerCase();
+      if (["assertive", "planning", "hypothetical", "historical", "retract"].includes(nextIntent)) {
+        intent = nextIntent;
+      }
+    }
+  } catch (_error) {
+    intent = "historical";
+  }
+
+  const refId = inboundMessageId || eventId.slice(0, 12);
+  return {
+    event_id: eventId,
+    event_ts: coerceIsoTimestamp(event?.timestamp),
+    domain,
+    entity_id: entityId || DEFAULT_ENTITY_ID,
+    field,
+    candidate_value: text,
+    intent,
+    source: {
+      type: normalizeSourceType(sourceType),
+      ref: `message:${channelId}:${conversationId}:${refId}`
+    },
+    corroborators: []
+  };
+}
+
+function maybeApplyNaturalDecision(params) {
+  const { stateApi, rootDir, text } = params;
+  const action = parseNaturalConfirmationAction(text);
+  if (!action) {
+    return { handled: false };
+  }
+
+  const state = stateApi.loadState(rootDir);
+  const resolved = resolvePrompt(rootDir, state, "");
+  if (resolved.error) {
+    return { handled: false };
+  }
+
+  runConfirmFlow({
+    stateApi,
+    rootDir,
+    parsed: { action },
+    promptId: resolved.promptId,
+    pending: resolved.pending
+  });
+  return {
+    handled: true,
+    action,
+    promptId: resolved.promptId
+  };
 }
 
 function buildCanonicalPrependContext(state, options = {}) {
@@ -493,6 +725,24 @@ function showPendingPrompt(rootDir, state, promptRef) {
 }
 
 function registerStateConsistencyBridge(api) {
+  const bridgeCfg = api.pluginConfig || {};
+  const autoIngestInbound = bridgeCfg.autoIngestInbound !== false;
+  const ingestChannels = resolveIngestChannels(bridgeCfg);
+  const ingestMinChars = Math.max(
+    3,
+    Number(bridgeCfg.ingestMinChars || process.env.STATE_INGEST_MIN_CHARS || DEFAULT_INGEST_MIN_CHARS)
+  );
+  const ingestMaxPending = Math.max(
+    1,
+    Number(bridgeCfg.ingestMaxPending || process.env.STATE_INGEST_MAX_PENDING || DEFAULT_INGEST_MAX_PENDING)
+  );
+  const ingestSourceType = normalizeSourceType(
+    bridgeCfg.ingestSourceType || process.env.STATE_INGEST_SOURCE_TYPE || DEFAULT_INGEST_SOURCE_TYPE
+  );
+  const ingestEntityId = String(bridgeCfg.entityId || process.env.STATE_ENTITY_ID || DEFAULT_ENTITY_ID);
+  const ingestAllowedSenders = parseStringSet(bridgeCfg.ingestAllowedSenders || process.env.STATE_INGEST_ALLOWED_SENDERS || "");
+  const projectOnIngest = bridgeCfg.projectOnIngest !== false;
+
   api.on("before_agent_start", async (_event, ctx) => {
     const cfg = api.pluginConfig || {};
     if (cfg.injectContext === false) {
@@ -513,6 +763,88 @@ function registerStateConsistencyBridge(api) {
       return;
     }
     return { prependContext };
+  });
+
+  api.on("message_received", async (event, ctx) => {
+    if (!autoIngestInbound) {
+      return;
+    }
+
+    const channelId = String(ctx?.channelId || "").toLowerCase();
+    if (!isChannelEnabled(ingestChannels, channelId)) {
+      return;
+    }
+    if (ingestAllowedSenders.size > 0 && !ingestAllowedSenders.has(String(event?.from || "").toLowerCase())) {
+      return;
+    }
+    if (looksLikeSelfMessage(event?.metadata)) {
+      return;
+    }
+
+    const rootDir = resolveRootDir(api, "");
+    const stateScriptPath = resolveStateScriptPath(api, rootDir);
+    if (!stateScriptPath) {
+      return;
+    }
+
+    let stateApi;
+    try {
+      stateApi = loadStateApi(stateScriptPath);
+    } catch (error) {
+      api.logger.warn?.(`state-consistency-bridge: failed to load runtime for message_received hook (${String(error.message || error)})`);
+      return;
+    }
+
+    try {
+      if (typeof stateApi.ensureStateFiles === "function") {
+        stateApi.ensureStateFiles(rootDir);
+      }
+    } catch (_error) {
+      // Ignore bootstrap failures; downstream reads will surface problems.
+    }
+
+    const text = normalizeInboundText(event?.content || "");
+    if (!text) {
+      return;
+    }
+
+    const decision = maybeApplyNaturalDecision({ stateApi, rootDir, text });
+    if (decision.handled) {
+      api.logger.info?.(`state-consistency-bridge: applied natural ${decision.action} for prompt ${decision.promptId.slice(0, 8)}`);
+      return;
+    }
+
+    if (shouldSkipInboundAssertion(text, ingestMinChars)) {
+      return;
+    }
+
+    const state = stateApi.loadState(rootDir);
+    const pendingCount = Object.keys(state.pending_confirmations || {}).length;
+    if (pendingCount >= ingestMaxPending) {
+      api.logger.debug?.(`state-consistency-bridge: skipped inbound ingestion (pending cap reached: ${pendingCount}/${ingestMaxPending})`);
+      return;
+    }
+
+    const observation = buildInboundObservation({
+      event,
+      ctx,
+      stateApi,
+      entityId: ingestEntityId,
+      sourceType: ingestSourceType
+    });
+    const ingestResult = stateApi.ingestObservation(rootDir, observation, { forceCommit: false });
+
+    if (ingestResult.status === "pending_confirmation" && ingestResult.prompt?.prompt_id) {
+      updateReviewState(rootDir, ingestResult.prompt.prompt_id);
+    }
+
+    if (projectOnIngest && typeof stateApi.renderHeartbeatProjection === "function") {
+      try {
+        stateApi.renderHeartbeatProjection(rootDir, { entity_id: ingestEntityId });
+      } catch (_error) {
+        // Projection failures should not break inbound message processing.
+      }
+    }
   });
 
   api.registerCommand({
@@ -572,9 +904,12 @@ function registerStateConsistencyBridge(api) {
 
 module.exports = registerStateConsistencyBridge;
 module.exports._internal = {
+  buildInboundObservation,
   buildCanonicalPrependContext,
   buildPromptButtons,
   buildPromptMessage,
+  maybeApplyNaturalDecision,
+  parseNaturalConfirmationAction,
   parseControlArgs,
   resolvePromptId,
   summarizeValue,

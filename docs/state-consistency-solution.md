@@ -42,6 +42,8 @@ Personal AI agents face a fundamental distributed systems problem: **maintaining
 - **Runtime bridge delivered (main chat + interception)**:
   - `plugins/state-consistency-bridge` OpenClaw plugin
   - `before_agent_start` canonical-state context injection into main-chat reasoning
+  - `message_received` auto-ingestion of inbound assertions into canonical `StateObservation` events
+  - Natural chat `yes/no` acknowledgements can auto-resolve active pending confirmations
   - `/state-confirm` command interception for Telegram Yes/No callback control messages
   - Immediate next-prompt handoff with inline Yes/No buttons (no manual scripts per decision)
 - **Natural-language E2E harness delivered**:

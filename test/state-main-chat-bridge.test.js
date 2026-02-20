@@ -10,8 +10,10 @@ const plugin = require("../plugins/state-consistency-bridge");
 const { ensureStateFiles, ingestObservation, loadState } = require("../scripts/state-consistency");
 
 const {
+  buildInboundObservation,
   buildCanonicalPrependContext,
   buildPromptButtons,
+  parseNaturalConfirmationAction,
   parseControlArgs,
   resolvePromptId
 } = require("../plugins/state-consistency-bridge")._internal;
@@ -36,6 +38,39 @@ function mkWorkspace() {
   fs.writeFileSync(path.join(dir, "HEARTBEAT.md"), "# HEARTBEAT.md\n", "utf8");
   fs.writeFileSync(path.join(dir, "MEMORY.md"), "# MEMORY.md\n", "utf8");
   return dir;
+}
+
+function makeFakeApi(rootDir) {
+  const registered = {
+    command: null
+  };
+  const hooks = {};
+  const api = {
+    pluginConfig: {
+      rootDir,
+      stateScriptPath: path.join(path.resolve(__dirname, ".."), "scripts", "state-consistency.js")
+    },
+    config: {
+      workspace: {
+        dir: rootDir
+      }
+    },
+    resolvePath(input) {
+      return path.resolve(String(input));
+    },
+    on(name, handler) {
+      hooks[name] = handler;
+    },
+    registerCommand(command) {
+      registered.command = command;
+    },
+    logger: {
+      info() {},
+      warn() {},
+      debug() {}
+    }
+  };
+  return { api, hooks, registered };
 }
 
 test("parseControlArgs supports prompt + yes/no and edit", () => {
@@ -73,6 +108,51 @@ test("resolvePromptId supports short refs and active fallback", () => {
 
   const active = resolvePromptId(pending, "", "b7af99a0-2385-4333-90aa-0089137426bd");
   assert.equal(active.promptId, "b7af99a0-2385-4333-90aa-0089137426bd");
+});
+
+test("parseNaturalConfirmationAction maps plain yes/no words", () => {
+  assert.equal(parseNaturalConfirmationAction("yes"), "confirm");
+  assert.equal(parseNaturalConfirmationAction("No."), "reject");
+  assert.equal(parseNaturalConfirmationAction("yeah"), "confirm");
+  assert.equal(parseNaturalConfirmationAction("tell me more"), "");
+});
+
+test("buildInboundObservation creates deterministic event ids and source refs", () => {
+  const rootDir = mkWorkspace();
+  ensureStateFiles(rootDir);
+  const stateApi = require("../scripts/state-consistency");
+
+  const event = {
+    from: "7986763678",
+    content: "We are in Tahoe now.",
+    timestamp: 1_708_800_000,
+    metadata: { messageId: "tg-1" }
+  };
+  const ctx = {
+    channelId: "telegram",
+    conversationId: "7986763678"
+  };
+
+  const a = buildInboundObservation({
+    event,
+    ctx,
+    stateApi,
+    entityId: "user:primary",
+    sourceType: "conversation_planning"
+  });
+  const b = buildInboundObservation({
+    event,
+    ctx,
+    stateApi,
+    entityId: "user:primary",
+    sourceType: "conversation_planning"
+  });
+
+  assert.equal(a.event_id, b.event_id);
+  assert.equal(a.domain, "travel");
+  assert.equal(a.field, "travel.current_assertion");
+  assert.equal(a.source.type, "conversation_planning");
+  assert.ok(a.source.ref.includes("message:telegram:7986763678:tg-1"));
 });
 
 test("buildPromptButtons uses /state-confirm callback command", () => {
@@ -142,30 +222,8 @@ test("plugin /state-confirm command commits pending confirmation", async () => {
   const ingested = ingestObservation(rootDir, event, { forceCommit: false });
   assert.equal(ingested.status, "pending_confirmation");
 
-  const registered = {
-    command: null
-  };
-  const fakeApi = {
-    pluginConfig: {
-      rootDir,
-      stateScriptPath: path.join(path.resolve(__dirname, ".."), "scripts", "state-consistency.js")
-    },
-    config: {
-      workspace: {
-        dir: rootDir
-      }
-    },
-    resolvePath(input) {
-      return path.resolve(String(input));
-    },
-    on() {},
-    registerCommand(command) {
-      registered.command = command;
-    },
-    logger: {}
-  };
-
-  plugin(fakeApi);
+  const { api, registered } = makeFakeApi(rootDir);
+  plugin(api);
   assert.ok(registered.command);
 
   const reply = await registered.command.handler({
@@ -179,4 +237,54 @@ test("plugin /state-confirm command commits pending confirmation", async () => {
   const state = loadState(rootDir);
   const record = state.entities?.["user:primary"]?.state?.travel?.telegram_bridge_test;
   assert.equal(record?.value, "We are in Tahoe now.");
+});
+
+test("message_received hook ingests assertions and natural yes commits active pending", async () => {
+  const rootDir = mkWorkspace();
+  ensureStateFiles(rootDir);
+  const nowSeconds = Math.floor(Date.now() / 1000);
+
+  const { api, hooks } = makeFakeApi(rootDir);
+  plugin(api);
+  assert.equal(typeof hooks.message_received, "function");
+
+  await hooks.message_received(
+    {
+      from: "7986763678",
+      content: "We are in Tahoe now.",
+      timestamp: nowSeconds,
+      metadata: { messageId: "tg-assertion-1" }
+    },
+    {
+      channelId: "telegram",
+      conversationId: "7986763678"
+    }
+  );
+
+  let state = loadState(rootDir);
+  const pendingIds = Object.keys(state.pending_confirmations);
+  assert.equal(pendingIds.length, 1);
+  const prompt = state.pending_confirmations[pendingIds[0]];
+  assert.equal(prompt.domain, "travel");
+  assert.equal(prompt.observation_event.field, "travel.current_assertion");
+
+  await hooks.message_received(
+    {
+      from: "7986763678",
+      content: "yes",
+      timestamp: nowSeconds + 1,
+      metadata: { messageId: "tg-confirm-1" }
+    },
+    {
+      channelId: "telegram",
+      conversationId: "7986763678"
+    }
+  );
+
+  state = loadState(rootDir);
+  assert.equal(Object.keys(state.pending_confirmations).length, 0);
+  assert.equal(
+    state.entities?.["user:primary"]?.state?.travel?.current_assertion?.value,
+    "We are in Tahoe now."
+  );
 });
