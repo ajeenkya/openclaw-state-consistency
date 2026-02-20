@@ -1,12 +1,12 @@
 # OpenClaw State Consistency Engine
 
-**Reliable memory for your AI agents - built by the community, for the community**
+**Reliable memory for your AI agents **
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Node.js](https://img.shields.io/badge/Node.js-20%2B-green)](https://nodejs.org)
 [![OpenClaw](https://img.shields.io/badge/OpenClaw-Compatible-blue)](https://openclaw.ai)
 
-> *"Your AI agent just told you something that isn't true. Again. Here's how we fixed it."*
+> *"Your AI agent just told you something that isn't true. Again. Here's how you fix it."*
 
 ---
 
@@ -14,7 +14,7 @@
 
 **February 19, 2026 - A Real Debugging Story**
 
-While building this very system to solve AI hallucination, our OpenClaw agent hallucinated a date in its own memory file:
+While building this very system to solve AI hallucination, my OpenClaw agent hallucinated a date in its own memory file:
 
 ```markdown
 **Current conversation started**: 2026-02-24
@@ -30,7 +30,7 @@ The agent then used this false memory to make decisions: *"We're on Day 5 of our
 - Context lost between sessions
 - Different information from calendar vs. files vs. conversation
 
-**This repository is our solution.** It's what we built to make our own agents reliable.
+**This repository is our solution.** It's built to make our own agents reliable.
 
 ---
 
@@ -212,20 +212,6 @@ export STATE_GOG_ACCOUNT="your-email@gmail.com"
   }
 }
 ```
-
----
-
-## Community Examples
-
-### Solo Developer
-*"I was constantly losing context between coding sessions. Now my agent remembers what I was working on and where I left off. Game changer for ADHD brain."*
-
-### Team Project
-*"Our 5-person team uses this to keep our project-management bot in sync. No more 'which branch are we deploying?' confusion."*
-
-### Content Creator  
-*"My AI assistant now knows my posting schedule, current projects, and deadlines. It actually helps me stay organized instead of giving me stale information."*
-
 ---
 
 ## Contributing
