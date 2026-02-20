@@ -35,9 +35,20 @@ npm run state:review-queue
 npm run state:pending
 npm run state:telegram-review:run
 npm run state:project
+npm run state:health
+npm run state:retry-dlq -- --limit 25
 npm run state:plugin:install
+npm run lint
+npm run schema:check
 npm test
 ```
+
+## Ops safety
+
+- `npm run state:health` returns operational health with:
+  - `pending`, `tentative`, `dlq`, `last_poll`, `last_review`
+- `npm run state:retry-dlq` retries due DLQ entries and marks each as:
+  - `resolved`, `pending_retry`, or `failed_permanent`
 
 ## Scheduling
 
@@ -108,6 +119,7 @@ Environment variables:
 - The runtime is Node.js-first and uses Ajv for strict JSON Schema validation.
 - Failed schema validation is sent to `memory/state-dlq.jsonl` with retry metadata.
 - Defaults are intentionally conservative; adaptive autonomy should be enabled only after rollout gates pass.
+- CI quality gates run on each PR/push to `main`: lint, schema check, and tests.
 
 ## License
 

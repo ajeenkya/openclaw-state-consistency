@@ -15,7 +15,8 @@ const {
   renderHeartbeatProjection,
   ingestSignalEvent,
   migrateToCanonical,
-  promoteReviewQueue
+  promoteReviewQueue,
+  retryDlqEntries
 } = require("../scripts/state-consistency");
 
 function mkWorkspace() {
@@ -348,4 +349,88 @@ test("projection writes machine-managed sections", () => {
   const heartbeat = fs.readFileSync(path.join(rootDir, "HEARTBEAT.md"), "utf8");
   assert.ok(heartbeat.includes("## Canonical State (Machine Managed)"));
   assert.ok(heartbeat.includes("## State Change Log (Machine Managed)"));
+});
+
+test("status exposes pending/tentative/dlq and poll/review timestamps", () => {
+  const rootDir = mkWorkspace();
+  ensureStateFiles(rootDir);
+
+  const invalidObservation = {
+    event_id: "bad-observation-for-dlq",
+    event_ts: new Date().toISOString()
+  };
+  const validationResult = ingestObservation(rootDir, invalidObservation);
+  assert.equal(validationResult.status, "validation_failed");
+
+  const pollTs = "2026-02-20T10:00:00.000Z";
+  const reviewTs = "2026-02-20T10:05:00.000Z";
+  const statePath = path.join(rootDir, "memory", "state-tracker.json");
+  const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  state.runtime.last_poll_at = pollTs;
+  fs.writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+  fs.writeFileSync(
+    path.join(rootDir, "memory", "state-telegram-review-state.json"),
+    `${JSON.stringify({ last_dispatched_at: reviewTs }, null, 2)}\n`,
+    "utf8"
+  );
+
+  const status = getStatus(rootDir);
+  assert.equal(status.pending, 0);
+  assert.equal(status.tentative, 0);
+  assert.equal(status.last_poll, pollTs);
+  assert.equal(status.last_review, reviewTs);
+  assert.equal(status.dlq.total, 1);
+  assert.equal(status.dlq.pending_retry, 1);
+});
+
+test("retry-dlq replays due observation entries and marks them resolved", () => {
+  const rootDir = mkWorkspace();
+  ensureStateFiles(rootDir);
+
+  const now = new Date().toISOString();
+  const dlqEntry = {
+    dlq_id: "dlq-retry-observation-1",
+    schema_name: "observation",
+    payload: {
+      event_id: "dlq-observation-commit-1",
+      event_id: "6af5c3f8-d628-4f95-a8df-99f7b22f18fd",
+      event_ts: now,
+      domain: "travel",
+      entity_id: "user:primary",
+      field: "travel.dlq_retry_check",
+      candidate_value: "Tahoe",
+      intent: "assertive",
+      source: {
+        type: "conversation_assertive",
+        ref: "dlq:test"
+      },
+      corroborators: []
+    },
+    validation_errors: [{ message: "seeded for retry test" }],
+    first_seen_ts: now,
+    retry_count: 0,
+    next_retry_ts: now,
+    status: "pending_retry"
+  };
+  fs.appendFileSync(
+    path.join(rootDir, "memory", "state-dlq.jsonl"),
+    `${JSON.stringify(dlqEntry)}\n`,
+    "utf8"
+  );
+
+  const retried = retryDlqEntries(rootDir, { include_not_due: true, limit: 5 });
+  assert.equal(retried.status, "ok");
+  assert.equal(retried.selected, 1);
+  assert.equal(retried.resolved, 1);
+  assert.equal(retried.pending_retry, 0);
+
+  const state = loadState(rootDir);
+  assert.equal(
+    state.entities["user:primary"].state.travel.dlq_retry_check.value,
+    "Tahoe"
+  );
+
+  const status = getStatus(rootDir);
+  assert.equal(status.dlq.total, 1);
+  assert.equal(status.dlq.resolved, 1);
 });

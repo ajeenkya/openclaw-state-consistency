@@ -13,6 +13,8 @@ const addFormats = require("ajv-formats");
 const MAX_PROCESSED_EVENT_IDS = 5000;
 const MAX_TENTATIVE_OBSERVATIONS = 1000;
 const DEFAULT_ENTITY_ID = "user:primary";
+const DLQ_RETRY_SCHEDULE_MS = [60_000, 5 * 60_000, 30 * 60_000, 2 * 60 * 60_000];
+const DLQ_DEFAULT_MAX_RETRIES = DLQ_RETRY_SCHEDULE_MS.length + 1;
 
 const DOMAIN_DEFAULTS = {
   travel: { ask_threshold: 0.65, auto_threshold: 0.9, margin_threshold: 0.15, calibration_remaining: 30 },
@@ -208,6 +210,7 @@ function getPaths(rootDir) {
     rootDir,
     heartbeat: path.join(rootDir, "HEARTBEAT.md"),
     memory: path.join(rootDir, "MEMORY.md"),
+    reviewState: path.join(rootDir, "memory", "state-telegram-review-state.json"),
     stateTracker: path.join(rootDir, "memory", "state-tracker.json"),
     stateChanges: path.join(rootDir, "memory", "state-changes.md"),
     stateDlq: path.join(rootDir, "memory", "state-dlq.jsonl"),
@@ -217,6 +220,31 @@ function getPaths(rootDir) {
       signalEvent: path.join(rootDir, "schemas", "signal_event.schema.json")
     }
   };
+}
+
+function maxIso(...values) {
+  let best = null;
+  let bestMs = -Infinity;
+  for (const value of values.flat()) {
+    if (!value) {
+      continue;
+    }
+    const ms = Date.parse(value);
+    if (!Number.isFinite(ms)) {
+      continue;
+    }
+    if (ms > bestMs) {
+      bestMs = ms;
+      best = new Date(ms).toISOString();
+    }
+  }
+  return best;
+}
+
+function computeDlqNextRetryTs(retryCount) {
+  const retryIndex = Math.max(0, Number(retryCount) || 0);
+  const waitMs = DLQ_RETRY_SCHEDULE_MS[Math.min(retryIndex, DLQ_RETRY_SCHEDULE_MS.length - 1)];
+  return new Date(Date.now() + waitMs).toISOString();
 }
 
 function resolveGogAccount(rootDir, explicitAccount) {
@@ -234,7 +262,9 @@ function createDefaultState() {
     runtime: {
       projection_mode: "legacy_string",
       adaptive_learning_enabled: false,
-      projection_hashes: {}
+      projection_hashes: {},
+      last_poll_at: null,
+      last_review_queue_at: null
     },
     domains: JSON.parse(JSON.stringify(DOMAIN_DEFAULTS)),
     source_reliability: { ...SOURCE_RELIABILITY_DEFAULTS },
@@ -268,8 +298,20 @@ function ensureStateFiles(rootDir) {
 function loadState(rootDir) {
   const paths = ensureStateFiles(rootDir);
   const state = readJsonIfExists(paths.stateTracker, createDefaultState());
-  state.runtime = state.runtime || { projection_mode: "legacy_string", adaptive_learning_enabled: false, projection_hashes: {} };
+  state.runtime = state.runtime || {
+    projection_mode: "legacy_string",
+    adaptive_learning_enabled: false,
+    projection_hashes: {},
+    last_poll_at: null,
+    last_review_queue_at: null
+  };
   state.runtime.projection_hashes = state.runtime.projection_hashes || {};
+  if (!Object.prototype.hasOwnProperty.call(state.runtime, "last_poll_at")) {
+    state.runtime.last_poll_at = null;
+  }
+  if (!Object.prototype.hasOwnProperty.call(state.runtime, "last_review_queue_at")) {
+    state.runtime.last_review_queue_at = null;
+  }
   state.domains = { ...DOMAIN_DEFAULTS, ...(state.domains || {}) };
   state.source_reliability = { ...SOURCE_RELIABILITY_DEFAULTS, ...(state.source_reliability || {}) };
   state.entities = state.entities || {};
@@ -491,21 +533,100 @@ function loadSchemaValidators(rootDir) {
 
 function writeDlqEntry(rootDir, schemaName, payload, errors, retryCount = 0, status = "pending_retry") {
   const paths = getPaths(rootDir);
-  const now = Date.now();
-  const retryScheduleMs = [60_000, 5 * 60_000, 30 * 60_000];
-  const waitMs = retryScheduleMs[Math.min(retryCount, retryScheduleMs.length - 1)];
+  const now = nowIso();
   const entry = {
     dlq_id: randomUuid(),
     schema_name: schemaName,
     payload,
     validation_errors: errors,
-    first_seen_ts: new Date(now).toISOString(),
+    first_seen_ts: now,
     retry_count: retryCount,
-    next_retry_ts: new Date(now + waitMs).toISOString(),
+    next_retry_ts: computeDlqNextRetryTs(retryCount),
     status
   };
   appendLine(paths.stateDlq, JSON.stringify(entry));
   return entry;
+}
+
+function appendDlqUpdate(rootDir, entry, update) {
+  const paths = getPaths(rootDir);
+  const record = {
+    dlq_id: entry.dlq_id,
+    schema_name: entry.schema_name,
+    ...update
+  };
+  appendLine(paths.stateDlq, JSON.stringify(record));
+  return record;
+}
+
+function loadDlqState(rootDir) {
+  const paths = ensureStateFiles(rootDir);
+  const text = readTextIfExists(paths.stateDlq, "");
+  const lines = text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  const byId = new Map();
+  let malformedLines = 0;
+
+  for (const line of lines) {
+    let record;
+    try {
+      record = JSON.parse(line);
+    } catch (_error) {
+      malformedLines += 1;
+      continue;
+    }
+    if (!record || typeof record !== "object" || !record.dlq_id) {
+      malformedLines += 1;
+      continue;
+    }
+    const previous = byId.get(record.dlq_id) || {};
+    byId.set(record.dlq_id, { ...previous, ...record });
+  }
+
+  return {
+    entries: Array.from(byId.values()),
+    malformed_lines: malformedLines
+  };
+}
+
+function getDlqSummary(rootDir) {
+  const { entries, malformed_lines } = loadDlqState(rootDir);
+  const now = Date.now();
+  const summary = {
+    total: entries.length,
+    pending_retry: 0,
+    due_now: 0,
+    resolved: 0,
+    failed_permanent: 0,
+    other: 0,
+    malformed_lines,
+    last_retry_at: null,
+    last_resolved_at: null
+  };
+
+  for (const entry of entries) {
+    const status = String(entry.status || "");
+    if (status === "pending_retry") {
+      summary.pending_retry += 1;
+      const retryAtMs = Date.parse(entry.next_retry_ts || "");
+      if (!Number.isFinite(retryAtMs) || retryAtMs <= now) {
+        summary.due_now += 1;
+      }
+    } else if (status === "resolved") {
+      summary.resolved += 1;
+    } else if (status === "failed_permanent") {
+      summary.failed_permanent += 1;
+    } else {
+      summary.other += 1;
+    }
+    summary.last_retry_at = maxIso(summary.last_retry_at, entry.last_retry_ts);
+    summary.last_resolved_at = maxIso(summary.last_resolved_at, entry.resolved_at);
+  }
+
+  return summary;
 }
 
 function validateOrDlq(rootDir, schemaName, payload) {
@@ -526,6 +647,132 @@ function validateOrDlq(rootDir, schemaName, payload) {
   }));
   const dlqEntry = writeDlqEntry(rootDir, schemaName, payload, errors);
   return { valid: false, errors, dlqEntry };
+}
+
+function retryDlqPayload(rootDir, entry, options = {}) {
+  const payload = entry.payload;
+  if (entry.schema_name === "observation") {
+    return ingestObservation(rootDir, payload, { forceCommit: Boolean(options.force_commit) });
+  }
+  if (entry.schema_name === "confirmation") {
+    return applyUserConfirmation(rootDir, payload);
+  }
+  if (entry.schema_name === "signal") {
+    return ingestSignalEvent(rootDir, payload, { forceCommit: Boolean(options.force_commit) });
+  }
+  return {
+    status: "unsupported_schema",
+    message: `Unsupported schema_name: ${entry.schema_name}`
+  };
+}
+
+function isDlqResolvedResult(schemaName, resultStatus) {
+  if (schemaName === "observation") {
+    return ["committed", "pending_confirmation", "tentative", "duplicate"].includes(resultStatus);
+  }
+  if (schemaName === "confirmation") {
+    return ["committed", "rejected"].includes(resultStatus);
+  }
+  if (schemaName === "signal") {
+    return resultStatus === "ok";
+  }
+  return false;
+}
+
+function isDlqPermanentFailure(resultStatus) {
+  return ["unsupported_schema", "not_found", "mismatch"].includes(resultStatus);
+}
+
+function retryDlqEntries(rootDir, options = {}) {
+  ensureStateFiles(rootDir);
+  const includeNotDue = Boolean(options.include_not_due);
+  const limit = Math.max(1, Number(options.limit || 25));
+  const maxRetries = Math.max(1, Number(options.max_retries || DLQ_DEFAULT_MAX_RETRIES));
+  const now = Date.now();
+  const { entries, malformed_lines } = loadDlqState(rootDir);
+
+  const candidates = entries
+    .filter((entry) => entry.status === "pending_retry")
+    .filter((entry) => entry.payload && entry.schema_name)
+    .filter((entry) => {
+      if (includeNotDue) {
+        return true;
+      }
+      const nextRetryMs = Date.parse(entry.next_retry_ts || "");
+      return !Number.isFinite(nextRetryMs) || nextRetryMs <= now;
+    })
+    .sort((a, b) => String(a.first_seen_ts || "").localeCompare(String(b.first_seen_ts || "")))
+    .slice(0, limit);
+
+  const summary = {
+    status: "ok",
+    malformed_lines,
+    selected: candidates.length,
+    resolved: 0,
+    pending_retry: 0,
+    failed_permanent: 0,
+    skipped: entries.filter((entry) => entry.status === "pending_retry").length - candidates.length,
+    items: []
+  };
+
+  for (const entry of candidates) {
+    let result;
+    try {
+      result = retryDlqPayload(rootDir, entry, options);
+    } catch (error) {
+      result = { status: "error", message: error.message };
+    }
+
+    const resultStatus = String(result?.status || "error");
+    const retryCount = Math.max(0, Number(entry.retry_count || 0)) + 1;
+    const itemSummary = {
+      dlq_id: entry.dlq_id,
+      schema_name: entry.schema_name,
+      result_status: resultStatus,
+      retry_count: retryCount
+    };
+
+    if (isDlqResolvedResult(entry.schema_name, resultStatus)) {
+      appendDlqUpdate(rootDir, entry, {
+        status: "resolved",
+        resolved_at: nowIso(),
+        last_retry_ts: nowIso(),
+        last_result_status: resultStatus,
+        retry_count: retryCount
+      });
+      summary.resolved += 1;
+      summary.items.push({ ...itemSummary, final_status: "resolved" });
+      continue;
+    }
+
+    const permanentFailure = isDlqPermanentFailure(resultStatus) || retryCount >= maxRetries;
+    if (permanentFailure) {
+      appendDlqUpdate(rootDir, entry, {
+        status: "failed_permanent",
+        last_retry_ts: nowIso(),
+        last_result_status: resultStatus,
+        retry_count: retryCount,
+        last_error: result?.message || resultStatus
+      });
+      summary.failed_permanent += 1;
+      summary.items.push({ ...itemSummary, final_status: "failed_permanent" });
+      continue;
+    }
+
+    appendDlqUpdate(rootDir, entry, {
+      status: "pending_retry",
+      last_retry_ts: nowIso(),
+      last_result_status: resultStatus,
+      retry_count: retryCount,
+      next_retry_ts: computeDlqNextRetryTs(retryCount),
+      last_error: result?.message || resultStatus
+    });
+    summary.pending_retry += 1;
+    summary.items.push({ ...itemSummary, final_status: "pending_retry" });
+  }
+
+  summary.dlq = getDlqSummary(rootDir);
+  return summary;
 }
 
 function ingestObservation(rootDir, observation, options = {}) {
@@ -1102,6 +1349,7 @@ function tentativeToObservation(tentative) {
 
 function promoteReviewQueue(rootDir, options = {}) {
   const state = loadState(rootDir);
+  state.runtime.last_review_queue_at = nowIso();
   const minConfidence = Number(options.min_confidence ?? 0.4);
   const limit = Math.max(1, Number(options.limit || 5));
   const maxPending = Math.max(1, Number(options.max_pending || 10));
@@ -1119,6 +1367,7 @@ function promoteReviewQueue(rootDir, options = {}) {
     .length;
   const remainingSlots = Math.max(0, maxPending - currentPendingCount);
   if (remainingSlots === 0) {
+    saveState(rootDir, state);
     return {
       status: "ok",
       promoted_count: 0,
@@ -1173,9 +1422,7 @@ function promoteReviewQueue(rootDir, options = {}) {
     );
   }
 
-  if (promoted.length > 0) {
-    saveState(rootDir, state);
-  }
+  saveState(rootDir, state);
 
   return {
     status: "ok",
@@ -1222,6 +1469,10 @@ function pollSignals(rootDir, options = {}) {
     summary.email = ingestSignalEvent(rootDir, signal, { forceCommit: Boolean(options.force_commit) });
     summary.email.fetched_threads = Array.isArray(threads) ? threads.length : 0;
   }
+
+  const state = loadState(rootDir);
+  state.runtime.last_poll_at = nowIso();
+  saveState(rootDir, state);
 
   return summary;
 }
@@ -1453,19 +1704,38 @@ function renderHeartbeatProjection(rootDir, options = {}) {
   };
 }
 
+function getLastReviewTimestamp(rootDir) {
+  const paths = getPaths(rootDir);
+  const reviewState = readJsonIfExistsSafe(paths.reviewState, {});
+  return maxIso(
+    reviewState.last_decision_at,
+    reviewState.last_dispatched_at,
+    reviewState.last_prompt_at
+  );
+}
+
 function getStatus(rootDir) {
   ensureStateFiles(rootDir);
   const state = loadState(rootDir);
   const entities = Object.keys(state.entities);
   const committedCount = toStableStateEntries(state).length;
   const pendingCount = Object.keys(state.pending_confirmations).length;
+  const tentativeCount = state.tentative_observations.length;
+  const dlq = getDlqSummary(rootDir);
+  const lastReview = getLastReviewTimestamp(rootDir);
   return {
     version: state.version,
     last_consistency_check: state.last_consistency_check,
     entities: entities.length,
     committed_fields: committedCount,
     pending_confirmations: pendingCount,
-    tentative_observations: state.tentative_observations.length,
+    tentative_observations: tentativeCount,
+    pending: pendingCount,
+    tentative: tentativeCount,
+    dlq,
+    last_poll: state.runtime.last_poll_at || null,
+    last_review_queue: state.runtime.last_review_queue_at || null,
+    last_review: lastReview,
     processed_event_ids: state.processed_event_ids.length,
     projection_mode: state.runtime.projection_mode,
     adaptive_learning_enabled: Boolean(state.runtime.adaptive_learning_enabled)
@@ -1519,6 +1789,7 @@ function usage() {
     "Commands:",
     "  init [--root <path>]",
     "  status [--root <path>]",
+    "  health [--root <path>]",
     `  migrate [--root <path>] [--entity-id ${DEFAULT_ENTITY_ID}] [--force-commit]`,
     "  ingest --file <observation.json> [--root <path>] [--force-commit]",
     "  extract --entity-id <id> --domain <domain> --text <text> --source-type <type> --source-ref <ref> [--field <field>] [--ingest] [--root <path>]",
@@ -1526,6 +1797,7 @@ function usage() {
     `  poll [--root <path>] [--entity-id ${DEFAULT_ENTITY_ID}] [--account email] [--calendar-only|--email-only] [--calendar-from today] [--calendar-to tomorrow] [--calendar-max 25] [--gmail-query "newer_than:2d"] [--gmail-max 25] [--project]`,
     "  review-queue [--root <path>] [--entity-id <id>] [--domain <domain>] [--min-confidence 0.4] [--limit 5] [--max-pending 10] [--project]",
     "  pending [--root <path>] [--entity-id <id>]",
+    "  retry-dlq [--root <path>] [--limit 25] [--max-retries 5] [--include-not-due] [--force-commit] [--project] [--entity-id <id>]",
     "  confirm --prompt-id <id> --action confirm|reject|edit [--edited-value <json-or-string>] [--root <path>]",
     "  project [--root <path>] [--entity-id <id>]"
   ];
@@ -1549,7 +1821,7 @@ function main(argv) {
       return 0;
     }
 
-    if (cmd === "status") {
+    if (cmd === "status" || cmd === "health") {
       printJson({ status: "ok", ...getStatus(rootDir) });
       return 0;
     }
@@ -1677,6 +1949,20 @@ function main(argv) {
       return 0;
     }
 
+    if (cmd === "retry-dlq") {
+      const result = retryDlqEntries(rootDir, {
+        limit: Number(args.limit || 25),
+        max_retries: Number(args["max-retries"] || DLQ_DEFAULT_MAX_RETRIES),
+        include_not_due: Boolean(args["include-not-due"]),
+        force_commit: Boolean(args["force-commit"])
+      });
+      if (args.project) {
+        renderHeartbeatProjection(rootDir, { entity_id: args["entity-id"] || "" });
+      }
+      printJson(result);
+      return 0;
+    }
+
     if (cmd === "confirm") {
       if (!args["prompt-id"] || !args.action) {
         throw new Error("--prompt-id and --action are required for confirm");
@@ -1743,6 +2029,7 @@ module.exports = {
   gmailThreadsToSignal,
   getPendingConfirmation,
   getStatus,
+  getDlqSummary,
   ingestObservation,
   ingestSignalEvent,
   pollSignals,
@@ -1750,6 +2037,7 @@ module.exports = {
   main,
   migrateToCanonical,
   promoteReviewQueue,
+  retryDlqEntries,
   renderHeartbeatProjection,
   validateOrDlq,
   applyUserConfirmation
