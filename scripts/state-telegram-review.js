@@ -56,12 +56,37 @@ function parseArgs(argv) {
 
 function getPaths(rootDir) {
   const home = process.env.HOME || "";
+  const agentsRoot = path.join(home, ".openclaw", "agents");
+  const sessionStores = [];
+  if (fs.existsSync(agentsRoot)) {
+    for (const entry of fs.readdirSync(agentsRoot, { withFileTypes: true })) {
+      if (!entry.isDirectory()) {
+        continue;
+      }
+      const sessionsDir = path.join(agentsRoot, entry.name, "sessions");
+      const sessionsIndex = path.join(sessionsDir, "sessions.json");
+      if (!fs.existsSync(sessionsIndex)) {
+        continue;
+      }
+      sessionStores.push({
+        agent: entry.name,
+        sessionsDir,
+        sessionsIndex
+      });
+    }
+  }
+  if (sessionStores.length === 0) {
+    sessionStores.push({
+      agent: "main",
+      sessionsDir: path.join(home, ".openclaw", "agents", "main", "sessions"),
+      sessionsIndex: path.join(home, ".openclaw", "agents", "main", "sessions", "sessions.json")
+    });
+  }
   return {
     rootDir,
     cronConfig: path.join(rootDir, "cron-config.json"),
     reviewState: path.join(rootDir, "memory", "state-telegram-review-state.json"),
-    sessionsIndex: path.join(home, ".openclaw", "agents", "main", "sessions", "sessions.json"),
-    sessionsDir: path.join(home, ".openclaw", "agents", "main", "sessions"),
+    sessionStores,
     stateConsistencyScript: path.join(rootDir, "scripts", "state-consistency.js")
   };
 }
@@ -189,14 +214,45 @@ function parseDecisionFromText(text) {
   if (!raw) {
     return { action: "none" };
   }
+  const callbackAction = raw.match(/^state_(confirm|reject|edit):([0-9a-f-]{8,36})$/i);
+  if (callbackAction) {
+    const action = callbackAction[1].toLowerCase();
+    const promptId = callbackAction[2].toLowerCase();
+    if (action === "edit") {
+      return { action: "edit_help", promptId };
+    }
+    return { action, promptId };
+  }
+
+  const shortRefAction = raw.match(/^(confirm|reject|edit)\s+([0-9a-f-]{8,36})\b[:\s-]*(.*)$/i);
+  if (shortRefAction) {
+    const action = shortRefAction[1].toLowerCase();
+    const promptId = shortRefAction[2].toLowerCase();
+    if (action === "edit") {
+      const maybeValue = String(shortRefAction[3] || "").trim();
+      if (!maybeValue) {
+        return { action: "edit_help", promptId };
+      }
+      return { action: "edit", promptId, editedValue: parseMaybeJsonValue(maybeValue) };
+    }
+    return { action, promptId };
+  }
+
   const idAction = raw.match(/([0-9a-f]{8}-[0-9a-f-]{27,})\s+(confirm|reject|edit)\b[:\s-]*(.*)$/i);
   if (idAction) {
     const action = idAction[2].toLowerCase();
     if (action === "edit") {
+      const maybeValue = String(idAction[3] || "").trim();
+      if (!maybeValue) {
+        return {
+          action: "edit_help",
+          promptId: idAction[1].toLowerCase()
+        };
+      }
       return {
         action: "edit",
         promptId: idAction[1].toLowerCase(),
-        editedValue: parseMaybeJsonValue(idAction[3])
+        editedValue: parseMaybeJsonValue(maybeValue)
       };
     }
     return {
@@ -262,54 +318,58 @@ function parseNewUserMessages(sessionFile, cursorOffset) {
 }
 
 function resolveSessionInfo(paths, target) {
-  const sessions = readJsonIfExists(paths.sessionsIndex, {});
-  const preferredKeys = [
-    `agent:main:openai-user:telegram:${target}`,
-    `telegram:${target}`,
-    "agent:main:main"
-  ];
+  const prefixedTarget = `telegram:${target}`;
+  const candidates = [];
 
-  for (const key of preferredKeys) {
-    const entry = sessions[key];
-    if (!entry || !entry.sessionId) {
-      continue;
-    }
-    if (key === "agent:main:main") {
-      const matchesTarget = (
-        entry?.origin?.from === `telegram:${target}` ||
-        entry?.origin?.to === `telegram:${target}` ||
-        entry?.lastTo === `telegram:${target}`
-      );
-      if (!matchesTarget) {
+  for (const store of paths.sessionStores || []) {
+    const sessions = readJsonIfExists(store.sessionsIndex, {});
+    for (const [key, entry] of Object.entries(sessions)) {
+      if (!entry || !entry.sessionId) {
         continue;
       }
+      const from = entry?.origin?.from || "";
+      const to = entry?.origin?.to || "";
+      const lastTo = entry?.lastTo || "";
+      const matches = (
+        key.includes(prefixedTarget) ||
+        from === prefixedTarget ||
+        to === prefixedTarget ||
+        lastTo === prefixedTarget
+      );
+      if (!matches) {
+        continue;
+      }
+      const sessionFile = entry.sessionFile || path.join(store.sessionsDir, `${entry.sessionId}.jsonl`);
+      candidates.push({
+        agent: store.agent,
+        key,
+        sessionId: entry.sessionId,
+        sessionFile,
+        updatedAt: Number(entry.updatedAt || 0)
+      });
     }
-    const sessionFile = entry.sessionFile || path.join(paths.sessionsDir, `${entry.sessionId}.jsonl`);
-    return {
-      sessionId: entry.sessionId,
-      sessionFile
-    };
   }
 
-  for (const [key, entry] of Object.entries(sessions)) {
-    if (!entry || !entry.sessionId) {
-      continue;
-    }
-    const from = entry?.origin?.from || "";
-    const to = entry?.origin?.to || "";
-    if (
-      key.includes(`telegram:${target}`) ||
-      from === `telegram:${target}` ||
-      to === `telegram:${target}`
-    ) {
-      const sessionFile = entry.sessionFile || path.join(paths.sessionsDir, `${entry.sessionId}.jsonl`);
-      return {
-        sessionId: entry.sessionId,
-        sessionFile
-      };
-    }
+  if (candidates.length === 0) {
+    return null;
   }
-  return null;
+
+  candidates.sort((a, b) => {
+    if (b.updatedAt !== a.updatedAt) {
+      return b.updatedAt - a.updatedAt;
+    }
+    const aExists = fs.existsSync(a.sessionFile) ? 1 : 0;
+    const bExists = fs.existsSync(b.sessionFile) ? 1 : 0;
+    return bExists - aExists;
+  });
+
+  const best = candidates[0];
+  return {
+    agent: best.agent,
+    key: best.key,
+    sessionId: best.sessionId,
+    sessionFile: best.sessionFile
+  };
 }
 
 function getPendingConfirmations(rootDir, entityId) {
@@ -342,29 +402,32 @@ function buildPromptMessage(pending, index, total) {
   const field = pending?.observation_event?.field || pending.proposed_change || "(unknown)";
   const value = summarizeValue(pending?.observation_event?.candidate_value, 300);
   const confidencePct = Math.round(Number(pending?.confidence || 0) * 100);
-  const domain = String(pending?.domain || "general");
+  const domain = String(pending?.domain || "general").replace(/^./, (m) => m.toUpperCase());
   const shortId = String(pending?.prompt_id || "").slice(0, 8);
   return [
-    `State update suggestion ${index}/${total}`,
+    `Quick state check ${index}/${total}`,
     "",
-    `Domain: ${domain}`,
-    `Proposed: ${field} = ${value}`,
+    `I detected a possible ${domain.toLowerCase()} update and want your confirmation before I act on it.`,
+    "",
+    `Proposed update`,
+    `${field} = ${value}`,
     `Confidence: ${confidencePct}%`,
-    `Ref: ${shortId}`,
+    `Reference: ${shortId}`,
     "",
-    "Choose one below.",
-    "For custom value, reply: edit: <new value>"
+    "Tap a button below.",
+    `If you want a custom value, reply: edit ${shortId} <new value>`
   ].join("\n");
 }
 
-function buildPromptButtons() {
+function buildPromptButtons(promptId) {
+  const id = String(promptId || "");
   return [
     [
-      { text: "✅ Confirm", callback_data: "confirm" },
-      { text: "❌ Reject", callback_data: "reject" }
+      { text: "✅ Confirm", callback_data: `state_confirm:${id}` },
+      { text: "❌ Reject", callback_data: `state_reject:${id}` }
     ],
     [
-      { text: "✏️ Edit value", callback_data: "edit" }
+      { text: "✏️ Edit value", callback_data: `state_edit:${id}` }
     ]
   ];
 }
@@ -399,6 +462,32 @@ function defaultReviewRuntimeState(target, entityId) {
   };
 }
 
+function matchesPromptReference(activePromptId, decisionPromptId) {
+  const active = String(activePromptId || "").toLowerCase();
+  const ref = String(decisionPromptId || "").toLowerCase();
+  if (!ref) {
+    return true;
+  }
+  if (active === ref) {
+    return true;
+  }
+  if (ref.length >= 8 && active.startsWith(ref)) {
+    return true;
+  }
+  return false;
+}
+
+function summarizePendingChange(pending) {
+  const field = pending?.observation_event?.field || pending?.proposed_change || "state update";
+  const value = summarizeValue(pending?.observation_event?.candidate_value, 180);
+  return `${field} = ${value}`;
+}
+
+function findPendingPrompt(rootDir, promptId) {
+  const state = loadState(rootDir);
+  return state?.pending_confirmations?.[promptId] || null;
+}
+
 function pickDecisionForActivePrompt(userMessages, activePromptId) {
   for (let i = userMessages.length - 1; i >= 0; i -= 1) {
     const msg = userMessages[i];
@@ -406,7 +495,7 @@ function pickDecisionForActivePrompt(userMessages, activePromptId) {
     if (!decision || decision.action === "none") {
       continue;
     }
-    if (decision.promptId && decision.promptId !== String(activePromptId || "").toLowerCase()) {
+    if (!matchesPromptReference(activePromptId, decision.promptId)) {
       continue;
     }
     return {
@@ -446,6 +535,7 @@ function syncReviewOnce(rootDir, options = {}) {
     status: "ok",
     target,
     session_id: runtime.session_id || null,
+    session_agent: sessionInfo?.agent || null,
     active_prompt_id: runtime.active_prompt_id || null,
     decision_applied: null,
     dispatched_prompt_id: null
@@ -458,16 +548,19 @@ function syncReviewOnce(rootDir, options = {}) {
     if (runtime.active_prompt_id) {
       const decision = pickDecisionForActivePrompt(parsed.userMessages, runtime.active_prompt_id);
       if (decision) {
+        const pendingForContext = findPendingPrompt(rootDir, runtime.active_prompt_id);
+        const shortId = String(runtime.active_prompt_id || "").slice(0, 8);
         if (decision.action === "edit_help") {
           if (!dryRun) {
             sendTelegramMessage(
               target,
               [
                 "Got it. Send your override like this:",
-                `edit: <new value>`,
+                `edit ${shortId} <new value>`,
                 "",
-                `Example: edit: \"Tahoe, Northstar\"`
-              ].join("\n"),
+                `Example: edit ${shortId} \"Tahoe, Northstar\"`,
+                pendingForContext ? `Current suggestion: ${summarizePendingChange(pendingForContext)}` : ""
+              ].filter(Boolean).join("\n"),
               threadId
             );
           }
@@ -485,11 +578,16 @@ function syncReviewOnce(rootDir, options = {}) {
 
           if (!dryRun) {
             const ack = decision.action === "confirm"
-              ? "Confirmed. I updated state."
+              ? [
+                  "Perfect, confirmed.",
+                  pendingForContext ? `Saved: ${summarizePendingChange(pendingForContext)}.` : "State updated.",
+                  "I’ll use this going forward."
+                ].join("\n")
               : decision.action === "reject"
-                ? "Rejected. No state change made."
-                : "Edited and confirmed. State updated.";
+                ? "Understood. I dropped that suggestion and kept state unchanged."
+                : "Done. I saved your edited value and updated state.";
             sendTelegramMessage(target, ack, threadId);
+            sendTelegramMessage(target, "Context synced to canonical state.", threadId);
           }
           runtime.last_decision_at = nowIso();
           runtime.active_prompt_id = "";
@@ -508,7 +606,7 @@ function syncReviewOnce(rootDir, options = {}) {
   if (!runtime.active_prompt_id && pending.length > 0) {
     const next = pending[0];
     const message = buildPromptMessage(next, 1, pending.length);
-    const buttons = buildPromptButtons();
+    const buttons = buildPromptButtons(next.prompt_id);
     const sendResult = dryRun ? { payload: { messageId: "dry-run" } } : sendTelegramMessage(target, message, threadId, buttons);
     runtime.active_prompt_id = next.prompt_id;
     runtime.active_message_id = String(sendResult?.payload?.messageId || "");

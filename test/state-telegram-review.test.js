@@ -32,6 +32,21 @@ test("parseDecisionFromText supports confirm/reject/edit commands", () => {
   assert.equal(edited.editedValue, "Tahoe Saturday");
 });
 
+test("parseDecisionFromText supports callback-data style actions", () => {
+  const id = "2013aa48-c103-403c-aa55-cbd3cf226e71";
+  const confirm = parseDecisionFromText(`state_confirm:${id}`);
+  assert.equal(confirm.action, "confirm");
+  assert.equal(confirm.promptId, id);
+
+  const reject = parseDecisionFromText(`state_reject:${id}`);
+  assert.equal(reject.action, "reject");
+  assert.equal(reject.promptId, id);
+
+  const edit = parseDecisionFromText(`state_edit:${id}`);
+  assert.equal(edit.action, "edit_help");
+  assert.equal(edit.promptId, id);
+});
+
 test("parseDecisionFromText supports prompt-id prefixed commands", () => {
   const id = "2013aa48-c103-403c-aa55-cbd3cf226e71";
   const parsed = parseDecisionFromText(`${id} edit: {"status":"done"}`);
@@ -51,19 +66,20 @@ test("buildPromptMessage renders concise conversational prompt", () => {
     }
   }, 1, 16);
 
-  assert.match(msg, /State update suggestion 1\/16/);
-  assert.match(msg, /Domain: travel/);
+  assert.match(msg, /Quick state check 1\/16/);
+  assert.match(msg, /possible travel update/i);
   assert.match(msg, /Confidence: 83%/);
-  assert.match(msg, /Choose one below/);
+  assert.match(msg, /Tap a button below/);
 });
 
 test("buildPromptButtons returns 3 inline actions", () => {
-  const buttons = buildPromptButtons();
+  const id = "2013aa48-c103-403c-aa55-cbd3cf226e71";
+  const buttons = buildPromptButtons(id);
   assert.equal(Array.isArray(buttons), true);
   assert.equal(buttons.length, 2);
   assert.equal(buttons[0].length, 2);
   assert.equal(buttons[1].length, 1);
-  assert.equal(buttons[0][0].callback_data, "confirm");
-  assert.equal(buttons[0][1].callback_data, "reject");
-  assert.equal(buttons[1][0].callback_data, "edit");
+  assert.equal(buttons[0][0].callback_data, `state_confirm:${id}`);
+  assert.equal(buttons[0][1].callback_data, `state_reject:${id}`);
+  assert.equal(buttons[1][0].callback_data, `state_edit:${id}`);
 });
