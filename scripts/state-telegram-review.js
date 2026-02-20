@@ -428,8 +428,8 @@ function buildPromptButtons(promptId) {
   const id = String(promptId || "");
   return [
     [
-      { text: "Yes", callback_data: `state_confirm:${id}` },
-      { text: "No", callback_data: `state_reject:${id}` }
+      { text: "Yes", callback_data: `/state-confirm ${id} yes` },
+      { text: "No", callback_data: `/state-confirm ${id} no` }
     ]
   ];
 }

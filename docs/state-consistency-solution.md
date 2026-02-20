@@ -39,6 +39,14 @@ Personal AI agents face a fundamental distributed systems problem: **maintaining
   - `scripts/state-uninstall-telegram-review-cron.sh`
   - `scripts/state-install-telegram-review-launchd.sh`
   - `scripts/state-uninstall-telegram-review-launchd.sh`
+- **Runtime bridge delivered (main chat + interception)**:
+  - `plugins/state-consistency-bridge` OpenClaw plugin
+  - `before_agent_start` canonical-state context injection into main-chat reasoning
+  - `/state-confirm` command interception for Telegram Yes/No callback control messages
+  - Immediate next-prompt handoff with inline Yes/No buttons (no manual scripts per decision)
+- **Natural-language E2E harness delivered**:
+  - `scripts/state-telegram-e2e.js` (`guide`, `prepare`, `status`, `verify`)
+  - End-to-end Telegram validation path for OSS users using normal chat interactions
 - **OSS hardening completed in this revision**:
   - Neutral default entity (`user:primary`) instead of personal IDs.
   - Removed hardcoded Telegram fallback target; runtime now requires explicit target config.
@@ -52,6 +60,8 @@ npm run state:poll
 npm run state:review-queue
 npm run state:pending
 npm run state:telegram-review:run
+npm run state:plugin:install
+npm run state:e2e:guide
 npm test
 ```
 

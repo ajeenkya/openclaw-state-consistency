@@ -9,6 +9,7 @@ It provides:
 - Deterministic markdown projection into machine-managed zones
 - Polling pipeline for calendar/email signals
 - Telegram-native one-by-one confirmation loop
+- Main-chat bridge plugin for canonical state injection + control-message interception
 
 ## Why this exists
 
@@ -34,6 +35,7 @@ npm run state:review-queue
 npm run state:pending
 npm run state:telegram-review:run
 npm run state:project
+npm run state:plugin:install
 npm test
 ```
 
@@ -52,6 +54,40 @@ npm run state:telegram-review:install-cron
 Telegram review loop (macOS launchd, lower latency):
 ```bash
 npm run state:telegram-review:install-launchd
+```
+
+Main-chat bridge plugin (inject canonical state + intercept `/state-confirm` callbacks):
+```bash
+npm run state:plugin:install
+```
+
+After plugin install, restart the OpenClaw gateway.
+
+## Main-chat integration
+
+The plugin at `plugins/state-consistency-bridge` adds:
+- `before_agent_start` canonical state injection into model context
+- `/state-confirm` command handling (Yes/No button callbacks bypass normal LLM replies)
+- Immediate next-pending prompt handoff with fresh Yes/No buttons
+
+The Telegram review dispatcher now sends button callbacks as:
+- `/state-confirm <promptId> yes`
+- `/state-confirm <promptId> no`
+
+This prevents the "What do you want me to confirm?" confusion path in main chat.
+
+## Natural-language E2E harness
+
+Manual Telegram test flow:
+```bash
+npm run state:e2e:guide
+npm run state:e2e:prepare -- --target <telegram_user_id>
+npm run state:e2e:verify -- --field travel.telegram_e2e --expected "We are in Tahoe now."
+```
+
+Status/debug helpers:
+```bash
+npm run state:e2e:status
 ```
 
 ## Configuration

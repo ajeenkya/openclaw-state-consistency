@@ -80,6 +80,6 @@ test("buildPromptButtons returns only yes/no actions", () => {
   assert.equal(buttons[0].length, 2);
   assert.equal(buttons[0][0].text, "Yes");
   assert.equal(buttons[0][1].text, "No");
-  assert.equal(buttons[0][0].callback_data, `state_confirm:${id}`);
-  assert.equal(buttons[0][1].callback_data, `state_reject:${id}`);
+  assert.equal(buttons[0][0].callback_data, `/state-confirm ${id} yes`);
+  assert.equal(buttons[0][1].callback_data, `/state-confirm ${id} no`);
 });

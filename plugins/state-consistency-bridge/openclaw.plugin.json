@@ -1,0 +1,50 @@
+{
+  "id": "state-consistency-bridge",
+  "name": "State Consistency Bridge",
+  "description": "Inject canonical state into main-chat reasoning and intercept Telegram state confirmations with /state-confirm.",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "rootDir": {
+        "type": "string"
+      },
+      "stateScriptPath": {
+        "type": "string"
+      },
+      "injectContext": {
+        "type": "boolean"
+      },
+      "includePending": {
+        "type": "boolean"
+      },
+      "injectMaxFields": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 200
+      }
+    }
+  },
+  "uiHints": {
+    "rootDir": {
+      "label": "State Root Directory",
+      "help": "Workspace root that contains memory/state-tracker.json and scripts/state-consistency.js"
+    },
+    "stateScriptPath": {
+      "label": "State Script Path",
+      "help": "Optional explicit path to state-consistency.js"
+    },
+    "injectContext": {
+      "label": "Inject Context",
+      "help": "Inject canonical state snapshot into before_agent_start context"
+    },
+    "includePending": {
+      "label": "Include Pending",
+      "help": "Include pending confirmations in injected context"
+    },
+    "injectMaxFields": {
+      "label": "Max Injected Fields",
+      "help": "Maximum committed fields to inject into the context snapshot"
+    }
+  }
+}

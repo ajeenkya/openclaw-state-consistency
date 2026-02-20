@@ -20,7 +20,13 @@
     "state:telegram-review:install-cron": "bash scripts/state-install-telegram-review-cron.sh",
     "state:telegram-review:uninstall-cron": "bash scripts/state-uninstall-telegram-review-cron.sh",
     "state:telegram-review:install-launchd": "bash scripts/state-install-telegram-review-launchd.sh",
-    "state:telegram-review:uninstall-launchd": "bash scripts/state-uninstall-telegram-review-launchd.sh"
+    "state:telegram-review:uninstall-launchd": "bash scripts/state-uninstall-telegram-review-launchd.sh",
+    "state:plugin:install": "bash scripts/state-install-openclaw-plugin.sh",
+    "state:plugin:uninstall": "bash scripts/state-uninstall-openclaw-plugin.sh",
+    "state:e2e:guide": "node scripts/state-telegram-e2e.js guide",
+    "state:e2e:prepare": "node scripts/state-telegram-e2e.js prepare",
+    "state:e2e:status": "node scripts/state-telegram-e2e.js status",
+    "state:e2e:verify": "node scripts/state-telegram-e2e.js verify"
   },
   "keywords": [
     "openclaw",
