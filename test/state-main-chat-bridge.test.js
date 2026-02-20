@@ -27,7 +27,8 @@ function mkWorkspace() {
   for (const file of [
     "state_observation.schema.json",
     "user_confirmation.schema.json",
-    "signal_event.schema.json"
+    "signal_event.schema.json",
+    "intent_extraction.schema.json"
   ]) {
     fs.copyFileSync(
       path.join(root, "schemas", file),
@@ -153,6 +154,8 @@ test("buildInboundObservation creates deterministic event ids and source refs", 
   assert.equal(a.field, "travel.current_assertion");
   assert.equal(a.source.type, "conversation_planning");
   assert.ok(a.source.ref.includes("message:telegram:7986763678:tg-1"));
+  assert.equal(typeof a.meta.extractor, "string");
+  assert.equal(typeof a.meta.fallback_used, "boolean");
 });
 
 test("buildPromptButtons uses /state-confirm callback command", () => {

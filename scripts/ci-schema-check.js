@@ -12,7 +12,8 @@ const ROOT = path.resolve(__dirname, "..");
 const SCHEMAS = [
   "schemas/state_observation.schema.json",
   "schemas/user_confirmation.schema.json",
-  "schemas/signal_event.schema.json"
+  "schemas/signal_event.schema.json",
+  "schemas/intent_extraction.schema.json"
 ];
 
 function loadJson(filePath) {

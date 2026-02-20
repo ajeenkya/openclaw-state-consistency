@@ -87,6 +87,9 @@ const FEW_SHOT_EXAMPLES = {
 };
 
 const VALID_DOMAINS = Object.keys(DOMAIN_DEFAULTS);
+const VALID_INTENTS = Object.keys(INTENT_FACTORS);
+const INTENT_EXTRACTOR_MODE_RULE = "rule";
+const INTENT_EXTRACTOR_MODE_COMMAND = "command";
 
 function nowIso() {
   return new Date().toISOString();
@@ -217,7 +220,8 @@ function getPaths(rootDir) {
     schemas: {
       stateObservation: path.join(rootDir, "schemas", "state_observation.schema.json"),
       userConfirmation: path.join(rootDir, "schemas", "user_confirmation.schema.json"),
-      signalEvent: path.join(rootDir, "schemas", "signal_event.schema.json")
+      signalEvent: path.join(rootDir, "schemas", "signal_event.schema.json"),
+      intentExtraction: path.join(rootDir, "schemas", "intent_extraction.schema.json")
     }
   };
 }
@@ -611,15 +615,17 @@ function loadSchemaValidators(rootDir) {
   const observationSchema = readJsonIfExists(paths.schemas.stateObservation, null);
   const confirmationSchema = readJsonIfExists(paths.schemas.userConfirmation, null);
   const signalSchema = readJsonIfExists(paths.schemas.signalEvent, null);
+  const intentExtractionSchema = readJsonIfExists(paths.schemas.intentExtraction, null);
 
-  if (!observationSchema || !confirmationSchema || !signalSchema) {
+  if (!observationSchema || !confirmationSchema || !signalSchema || !intentExtractionSchema) {
     throw new Error("Schema files missing. Expected files under ./schemas/");
   }
 
   return {
     observation: ajv.compile(observationSchema),
     confirmation: ajv.compile(confirmationSchema),
-    signal: ajv.compile(signalSchema)
+    signal: ajv.compile(signalSchema),
+    intentExtraction: ajv.compile(intentExtractionSchema)
   };
 }
 
@@ -721,7 +727,7 @@ function getDlqSummary(rootDir) {
   return summary;
 }
 
-function validateOrDlq(rootDir, schemaName, payload) {
+function validateSchema(rootDir, schemaName, payload, options = {}) {
   const validators = loadSchemaValidators(rootDir);
   const validator = validators[schemaName];
   if (!validator) {
@@ -737,8 +743,15 @@ function validateOrDlq(rootDir, schemaName, payload) {
     message: error.message,
     params: error.params
   }));
+  if (options.dlqOnFailure === false) {
+    return { valid: false, errors };
+  }
   const dlqEntry = writeDlqEntry(rootDir, schemaName, payload, errors);
   return { valid: false, errors, dlqEntry };
+}
+
+function validateOrDlq(rootDir, schemaName, payload) {
+  return validateSchema(rootDir, schemaName, payload, { dlqOnFailure: true });
 }
 
 function retryDlqPayload(rootDir, entry, options = {}) {
@@ -1208,7 +1221,7 @@ function gmailThreadsToSignal(entityId, threads, sourceRef, mode = "poll") {
   };
 }
 
-function classifyIntent(text) {
+function classifyIntentRuleBased(text) {
   const line = text.toLowerCase();
   if (/\b(if|might|maybe|could|would)\b/.test(line)) {
     return { intent: "hypothetical", confidence: 0.62, reason: "conditional language detected" };
@@ -1225,23 +1238,161 @@ function classifyIntent(text) {
   return { intent: "historical", confidence: 0.55, reason: "default fallback classification" };
 }
 
+function classifyIntent(text) {
+  return classifyIntentRuleBased(text);
+}
+
 function buildFewShotPrompt(domain, text) {
   const examples = FEW_SHOT_EXAMPLES[domain] || FEW_SHOT_EXAMPLES.general;
   return [
-    "Classify intent using strict JSON only. Allowed intents: assertive, planning, hypothetical, historical.",
-    "Return JSON object: {\"intent\":\"...\",\"reason\":\"...\"}",
+    "Classify intent using strict JSON only. Allowed intents: assertive, planning, hypothetical, historical, retract.",
+    "Return JSON object: {\"intent\":\"...\",\"confidence\":0.0,\"reason\":\"...\",\"domain\":\"...\"}",
     "",
     "Examples:",
-    ...examples.map((x) => `Input: ${x.input}\nOutput: {"intent":"${x.intent}","reason":"..."}`),
+    ...examples.map((x) => `Input: ${x.input}\nOutput: {"intent":"${x.intent}","confidence":0.8,"reason":"...","domain":"${domain}"}`),
     "",
     `Input: ${text}`,
     "Output:"
   ].join("\n");
 }
 
+function normalizeIntentExtractorMode(value) {
+  const mode = String(value || "").trim().toLowerCase();
+  if (mode === INTENT_EXTRACTOR_MODE_COMMAND) {
+    return INTENT_EXTRACTOR_MODE_COMMAND;
+  }
+  return INTENT_EXTRACTOR_MODE_RULE;
+}
+
+function resolveIntentExtractorOptions(options = {}) {
+  const env = options.env || process.env;
+  return {
+    mode: normalizeIntentExtractorMode(options.intent_extractor_mode || env.STATE_INTENT_EXTRACTOR_MODE || INTENT_EXTRACTOR_MODE_RULE),
+    command: String(options.intent_extractor_cmd || env.STATE_INTENT_EXTRACTOR_CMD || "").trim()
+  };
+}
+
+function parseIntentExtractorJson(rawOutput) {
+  const raw = String(rawOutput || "").trim();
+  if (!raw) {
+    throw new Error("extractor returned empty output");
+  }
+  let jsonText = raw;
+  const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+  if (fenced && fenced[1]) {
+    jsonText = fenced[1].trim();
+  }
+  const parsed = JSON.parse(jsonText);
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("extractor output must be a JSON object");
+  }
+  return parsed;
+}
+
+function runIntentExtractorCommand(command, payload) {
+  if (!command) {
+    throw new Error("STATE_INTENT_EXTRACTOR_CMD is required when STATE_INTENT_EXTRACTOR_MODE=command");
+  }
+  try {
+    const output = execFileSync("sh", ["-lc", command], {
+      input: `${JSON.stringify(payload)}\n`,
+      encoding: "utf8",
+      stdio: ["pipe", "pipe", "pipe"],
+      maxBuffer: 1024 * 1024
+    });
+    return parseIntentExtractorJson(output);
+  } catch (error) {
+    const stderr = error.stderr ? String(error.stderr).trim() : "";
+    const stdout = error.stdout ? String(error.stdout).trim() : "";
+    const message = stderr || stdout || error.message;
+    throw new Error(`intent extractor command failed: ${message}`);
+  }
+}
+
+function normalizeIntentExtractionResult(result, domain) {
+  return {
+    intent: String(result?.intent || "").trim().toLowerCase(),
+    confidence: Number(result?.confidence),
+    reason: String(result?.reason || "").trim(),
+    domain: String(result?.domain || domain || "general").trim().toLowerCase()
+  };
+}
+
+function extractIntentInfo(rootDir, options = {}) {
+  const domain = VALID_DOMAINS.includes(options.domain) ? options.domain : "general";
+  const text = String(options.text || "");
+  const fallback = { ...classifyIntentRuleBased(text), domain };
+  const settings = resolveIntentExtractorOptions(options);
+
+  if (settings.mode !== INTENT_EXTRACTOR_MODE_COMMAND) {
+    const validation = validateSchema(rootDir, "intentExtraction", fallback, { dlqOnFailure: false });
+    return {
+      ...fallback,
+      mode: settings.mode,
+      method: validation.valid ? "rule_based_schema_validated" : "rule_based_fallback",
+      fallback_used: !validation.valid,
+      fallback_reason: validation.valid ? "" : "rule_output_schema_validation_failed"
+    };
+  }
+
+  const payload = {
+    task: "intent_extraction",
+    domain,
+    text,
+    allowed_intents: VALID_INTENTS,
+    output_schema: {
+      type: "object",
+      required: ["intent", "confidence", "reason"],
+      additionalProperties: false
+    },
+    few_shot_prompt: buildFewShotPrompt(domain, text)
+  };
+
+  let extracted;
+  try {
+    extracted = runIntentExtractorCommand(settings.command, payload);
+  } catch (error) {
+    return {
+      ...fallback,
+      mode: settings.mode,
+      method: "rule_based_fallback",
+      fallback_used: true,
+      fallback_reason: `command_execution_failed:${error.message}`
+    };
+  }
+
+  const normalized = normalizeIntentExtractionResult(extracted, domain);
+  const validation = validateSchema(rootDir, "intentExtraction", normalized, { dlqOnFailure: false });
+  if (!validation.valid) {
+    return {
+      ...fallback,
+      mode: settings.mode,
+      method: "rule_based_fallback",
+      fallback_used: true,
+      fallback_reason: "command_schema_validation_failed"
+    };
+  }
+
+  return {
+    ...normalized,
+    confidence: round3(clamp(normalized.confidence, 0, 1)),
+    mode: settings.mode,
+    method: "command_schema_validated",
+    fallback_used: false,
+    fallback_reason: ""
+  };
+}
+
 function extractObservationFromText(options) {
   const domain = VALID_DOMAINS.includes(options.domain) ? options.domain : "general";
-  const intentInfo = classifyIntent(options.text);
+  const rootDir = path.resolve(options.root_dir || process.cwd());
+  const intentInfo = extractIntentInfo(rootDir, {
+    domain,
+    text: options.text,
+    env: options.env,
+    intent_extractor_mode: options.intent_extractor_mode,
+    intent_extractor_cmd: options.intent_extractor_cmd
+  });
   const field = options.field || `${domain}.note`;
   const observation = {
     event_id: randomUuid(),
@@ -1257,9 +1408,13 @@ function extractObservationFromText(options) {
     },
     corroborators: options.corroborators || [],
     meta: {
-      extractor: "rule_based_v1",
+      extractor: intentInfo.method,
+      intent_extractor_mode: intentInfo.mode,
       classifier_confidence: intentInfo.confidence,
       classifier_reason: intentInfo.reason,
+      classifier_domain: intentInfo.domain,
+      fallback_used: Boolean(intentInfo.fallback_used),
+      fallback_reason: intentInfo.fallback_reason || "",
       few_shot_prompt: buildFewShotPrompt(domain, options.text)
     }
   };
@@ -1852,7 +2007,8 @@ function getDoctorReport(rootDir, options = {}) {
   const schemaChecks = [
     { name: "StateObservation", file: paths.schemas.stateObservation },
     { name: "UserConfirmation", file: paths.schemas.userConfirmation },
-    { name: "SignalEvent", file: paths.schemas.signalEvent }
+    { name: "SignalEvent", file: paths.schemas.signalEvent },
+    { name: "IntentExtraction", file: paths.schemas.intentExtraction }
   ].map((schemaDef) => {
     if (!fs.existsSync(schemaDef.file)) {
       const fix = `Restore missing schema file: ${schemaDef.file}`;
@@ -2417,6 +2573,7 @@ module.exports = {
   SOURCE_RELIABILITY_DEFAULTS,
   buildFewShotPrompt,
   classifyIntent,
+  extractIntentInfo,
   createDefaultState,
   ensureStateFiles,
   extractObservationFromText,

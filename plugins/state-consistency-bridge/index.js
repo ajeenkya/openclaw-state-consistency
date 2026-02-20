@@ -487,7 +487,7 @@ function readInboundMessageId(event) {
 }
 
 function buildInboundObservation(params) {
-  const { event, ctx, stateApi, entityId, sourceType } = params;
+  const { event, ctx, stateApi, rootDir, entityId, sourceType } = params;
   const text = normalizeInboundText(event?.content || "");
   const domain = inferDomainFromText(text);
   const field = `${domain}.current_assertion`;
@@ -510,17 +510,45 @@ function buildInboundObservation(params) {
   ].join("|");
   const eventId = deterministicUuidFromText(`state-chat-observation:${fingerprint}`);
 
-  let intent = "historical";
+  let intentInfo = {
+    intent: "historical",
+    confidence: 0.55,
+    reason: "default fallback classification",
+    method: "bridge_default",
+    mode: "rule",
+    fallback_used: false,
+    fallback_reason: ""
+  };
   try {
-    if (typeof stateApi.classifyIntent === "function") {
+    if (typeof stateApi.extractIntentInfo === "function") {
+      const extracted = stateApi.extractIntentInfo(rootDir || process.cwd(), { domain, text });
+      const nextIntent = String(extracted?.intent || "").toLowerCase();
+      if (["assertive", "planning", "hypothetical", "historical", "retract"].includes(nextIntent)) {
+        intentInfo = {
+          ...intentInfo,
+          ...extracted,
+          intent: nextIntent
+        };
+      }
+    } else if (typeof stateApi.classifyIntent === "function") {
       const classified = stateApi.classifyIntent(text);
       const nextIntent = String(classified?.intent || "").toLowerCase();
       if (["assertive", "planning", "hypothetical", "historical", "retract"].includes(nextIntent)) {
-        intent = nextIntent;
+        intentInfo = {
+          ...intentInfo,
+          ...classified,
+          intent: nextIntent,
+          method: "rule_based_legacy"
+        };
       }
     }
   } catch (_error) {
-    intent = "historical";
+    intentInfo = {
+      ...intentInfo,
+      intent: "historical",
+      fallback_used: true,
+      fallback_reason: "bridge_extractor_error"
+    };
   }
 
   const refId = inboundMessageId || eventId.slice(0, 12);
@@ -531,12 +559,20 @@ function buildInboundObservation(params) {
     entity_id: entityId || DEFAULT_ENTITY_ID,
     field,
     candidate_value: text,
-    intent,
+    intent: intentInfo.intent,
     source: {
       type: normalizeSourceType(sourceType),
       ref: `message:${channelId}:${conversationId}:${refId}`
     },
-    corroborators: []
+    corroborators: [],
+    meta: {
+      extractor: intentInfo.method || "bridge_default",
+      intent_extractor_mode: intentInfo.mode || "rule",
+      classifier_confidence: Number(intentInfo.confidence || 0),
+      classifier_reason: String(intentInfo.reason || ""),
+      fallback_used: Boolean(intentInfo.fallback_used),
+      fallback_reason: String(intentInfo.fallback_reason || "")
+    }
   };
 }
 
@@ -829,6 +865,7 @@ function registerStateConsistencyBridge(api) {
       event,
       ctx,
       stateApi,
+      rootDir,
       entityId: ingestEntityId,
       sourceType: ingestSourceType
     });

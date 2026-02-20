@@ -17,7 +17,8 @@ const {
   ingestSignalEvent,
   migrateToCanonical,
   promoteReviewQueue,
-  retryDlqEntries
+  retryDlqEntries,
+  extractObservationFromText
 } = require("../scripts/state-consistency");
 
 function mkWorkspace() {
@@ -29,7 +30,8 @@ function mkWorkspace() {
   for (const file of [
     "state_observation.schema.json",
     "user_confirmation.schema.json",
-    "signal_event.schema.json"
+    "signal_event.schema.json",
+    "intent_extraction.schema.json"
   ]) {
     fs.copyFileSync(
       path.join(root, "schemas", file),
@@ -68,6 +70,12 @@ function mkWorkspace() {
 function writeExecutable(dir, name) {
   const filePath = path.join(dir, name);
   fs.writeFileSync(filePath, "#!/bin/sh\nexit 0\n", "utf8");
+  fs.chmodSync(filePath, 0o755);
+  return filePath;
+}
+
+function writeShellScript(filePath, body) {
+  fs.writeFileSync(filePath, `#!/bin/sh\n${body}\n`, "utf8");
   fs.chmodSync(filePath, 0o755);
   return filePath;
 }
@@ -318,6 +326,81 @@ test("signal item ref keeps poll ingestion idempotent across runs", () => {
   assert.equal(first.status, "ok");
   assert.equal(second.status, "ok");
   assert.equal(second.duplicate, 1);
+});
+
+test("structured intent extraction uses command output when schema-valid", () => {
+  const rootDir = mkWorkspace();
+  ensureStateFiles(rootDir);
+
+  const commandPath = writeShellScript(
+    path.join(rootDir, "intent-extractor-ok.sh"),
+    "printf '{\"intent\":\"assertive\",\"confidence\":0.93,\"reason\":\"explicit present-tense assertion\",\"domain\":\"travel\"}'"
+  );
+
+  const observation = extractObservationFromText({
+    root_dir: rootDir,
+    entity_id: "user:primary",
+    domain: "travel",
+    text: "We are in Tahoe now.",
+    source_type: "conversation_assertive",
+    source_ref: "message:test:1",
+    intent_extractor_mode: "command",
+    intent_extractor_cmd: JSON.stringify(commandPath)
+  });
+
+  assert.equal(observation.intent, "assertive");
+  assert.equal(observation.meta.extractor, "command_schema_validated");
+  assert.equal(observation.meta.intent_extractor_mode, "command");
+  assert.equal(observation.meta.fallback_used, false);
+});
+
+test("structured intent extraction falls back when command output fails schema", () => {
+  const rootDir = mkWorkspace();
+  ensureStateFiles(rootDir);
+
+  const commandPath = writeShellScript(
+    path.join(rootDir, "intent-extractor-invalid.sh"),
+    "printf '{\"intent\":\"assertive\",\"confidence\":1.6,\"reason\":\"invalid confidence\"}'"
+  );
+
+  const observation = extractObservationFromText({
+    root_dir: rootDir,
+    entity_id: "user:primary",
+    domain: "travel",
+    text: "If weather clears, we might leave earlier.",
+    source_type: "conversation_planning",
+    source_ref: "message:test:2",
+    intent_extractor_mode: "command",
+    intent_extractor_cmd: JSON.stringify(commandPath)
+  });
+
+  assert.equal(observation.intent, "hypothetical");
+  assert.equal(observation.meta.extractor, "rule_based_fallback");
+  assert.equal(observation.meta.intent_extractor_mode, "command");
+  assert.equal(observation.meta.fallback_used, true);
+  assert.equal(observation.meta.fallback_reason, "command_schema_validation_failed");
+});
+
+test("structured intent extraction falls back when command execution fails", () => {
+  const rootDir = mkWorkspace();
+  ensureStateFiles(rootDir);
+
+  const observation = extractObservationFromText({
+    root_dir: rootDir,
+    entity_id: "user:primary",
+    domain: "general",
+    text: "This might change later.",
+    source_type: "conversation_planning",
+    source_ref: "message:test:3",
+    intent_extractor_mode: "command",
+    intent_extractor_cmd: "/bin/path-that-does-not-exist"
+  });
+
+  assert.equal(observation.intent, "hypothetical");
+  assert.equal(observation.meta.extractor, "rule_based_fallback");
+  assert.equal(observation.meta.intent_extractor_mode, "command");
+  assert.equal(observation.meta.fallback_used, true);
+  assert.ok(String(observation.meta.fallback_reason).startsWith("command_execution_failed:"));
 });
 
 test("migration ingests HEARTBEAT/MEMORY into canonical state", () => {

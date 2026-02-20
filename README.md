@@ -123,6 +123,12 @@ Environment variables:
 - `STATE_INGEST_MAX_PENDING` (default: `10`)
 - `STATE_INGEST_SOURCE_TYPE` (`conversation_planning` or `conversation_assertive`)
 - `STATE_INGEST_ALLOWED_SENDERS` (optional csv sender-id allowlist)
+- `STATE_INTENT_EXTRACTOR_MODE` (`rule` default, or `command`)
+- `STATE_INTENT_EXTRACTOR_CMD` (required when mode is `command`; command reads JSON on stdin and must output schema-valid JSON)
+
+Structured intent extractor output contract (`schemas/intent_extraction.schema.json`):
+- `{"intent":"assertive|planning|hypothetical|historical|retract","confidence":0..1,"reason":"...","domain":"..."?}`
+- Any command output that fails strict schema validation is rejected and the runtime falls back to deterministic rule-based classification.
 
 ## Notes
 
